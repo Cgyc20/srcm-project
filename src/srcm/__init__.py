@@ -1,3 +1,3 @@
-from srcm.hybrid_solver import Domain
+from srcm.hybrid_solver import Domain, ConversionParams
 
-__all__ = ["Domain"]
+__all__ = ["Domain", "ConversionParams"]
