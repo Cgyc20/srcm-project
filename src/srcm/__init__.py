@@ -1,3 +1,3 @@
-from srcm.hybrid_solver import Domain, ConversionParams
+from srcm.hybrid_solver import Domain, ConversionParams, MassProjector
 
-__all__ = ["Domain", "ConversionParams"]
+__all__ = ["Domain", "ConversionParams", "MassProjector"]

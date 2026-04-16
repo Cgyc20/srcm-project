@@ -31,6 +31,37 @@ import pytest
 #     assert np.array_equal(mask, expected)
 
 
+def test_zero_thresholds():
+    """Verify that the system handles zero thresholds (immediate conversion)."""
+    # This is a valid boundary case
+    conv = ConversionParams(threshold=0.0, rate=1.0)
+    combined = np.array([[0.0, 0.1]])
+    
+    # DC_mask is mass > threshold. 0.1 > 0.0 is True.
+    mask = conv.DC_mask(combined)
+    assert np.array_equal(mask, np.array([[0, 1]], dtype=np.int8))
+
+def test_negative_params_raise():
+    """Ensure negative rates or thresholds are caught immediately."""
+    with pytest.raises(ValueError, match="rate must be >= 0"):
+        ConversionParams(rate=-1.0, threshold=5.0)
+    
+    with pytest.raises(ValueError, match="DC_threshold must be >= 0"):
+        ConversionParams(rate=1.0, DC_threshold=-0.5, CD_threshold=0.1)
+
+def test_mismatched_species_arrays():
+    """
+    If combined_mass has 3 species, but DC_threshold only has 2,
+    it should raise a ValueError during the mask calculation.
+    """
+    thr_arr = np.array([5.0, 5.0]) # 2 species
+    conv = ConversionParams(threshold=thr_arr, rate=1.0)
+    
+    combined = np.ones((3, 10)) # 3 species
+    
+    with pytest.raises(ValueError, match="matching combined_mass"):
+        conv.DC_mask(combined)
+        
 def test_single_threshold_initialization():
     # Test Scalar
     conv = ConversionParams(threshold=10, rate=1.0)
