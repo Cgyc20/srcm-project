@@ -1,5 +1,5 @@
 import numpy as np
-from srcm_engine.core import gillespie_draw
+from srcm import gillespie_draw
 
 
 def test_gillespie_zero_propensity():
