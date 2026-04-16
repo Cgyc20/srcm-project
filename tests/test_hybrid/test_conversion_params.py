@@ -61,7 +61,7 @@ def test_mismatched_species_arrays():
     
     with pytest.raises(ValueError, match="matching combined_mass"):
         conv.DC_mask(combined)
-        
+
 def test_single_threshold_initialization():
     # Test Scalar
     conv = ConversionParams(threshold=10, rate=1.0)
