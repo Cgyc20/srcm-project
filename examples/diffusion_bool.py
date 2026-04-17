@@ -8,11 +8,11 @@ def main():
     # Shared parameters
     # ============================================================
     K_ssa = 40
-    pde_multiple = 4
+    pde_multiple = 1
     K_pde = K_ssa * pde_multiple
 
     L = 25.0
-    total_time = 50.0
+    total_time = 30.0
     dt = 0.1
 
     h_ssa = L / K_ssa
@@ -40,7 +40,7 @@ def main():
     # ============================================================
     # HYBRID + SSA model
     # ============================================================
-    hybrid_model = SRCMModel(["U"], boundary="zero-flux")
+    hybrid_model = SRCMModel(["U"], boundary="periodic")
 
     hybrid_model.diffusion(U=0.1)
     hybrid_model.rates()

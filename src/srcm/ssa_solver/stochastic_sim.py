@@ -95,13 +95,30 @@ class SSAEngine:
             )
 
         # diffusion blocks
+        # for species_index in range(self.n_species):
+        #     start_idx = species_index * self.K
+        #     end_idx = (species_index + 1) * self.K
+        #     propensity_vector[start_idx:end_idx] = (
+        #         self.jump_rate_list[species_index] * frame[species_index, :] * 2.0
+        #     )
+
         for species_index in range(self.n_species):
             start_idx = species_index * self.K
             end_idx = (species_index + 1) * self.K
-            propensity_vector[start_idx:end_idx] = (
-                self.jump_rate_list[species_index] * frame[species_index, :] * 2.0
-            )
+            n = frame[species_index, :]
 
+            if self.boundary_conditions == "periodic":
+                propensity_vector[start_idx:end_idx] = 2.0 * self.jump_rate_list[species_index] * n
+
+            else:  # zero-flux
+                rates = 2.0 * self.jump_rate_list[species_index] * n
+
+                if self.K >= 1:
+                    rates[0] = self.jump_rate_list[species_index] * n[0]
+                    rates[-1] = self.jump_rate_list[species_index] * n[-1]
+
+                propensity_vector[start_idx:end_idx] = rates
+                
         # reaction blocks
         for i, reaction in enumerate(self.reaction_set):
             start = self.K * self.n_species + i * self.K

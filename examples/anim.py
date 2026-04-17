@@ -6,12 +6,12 @@ from matplotlib.animation import FuncAnimation
 # ------------------------------------------------------------
 # Settings
 # ------------------------------------------------------------
-STRIDE = 5
-INTERVAL_MS = 200
+STRIDE = 1
+INTERVAL_MS = 500
 BLIT = False
 REPEAT = True
 
-hybrid_path = "output/diffusion_one_species_central_peak.npz"   # or None
+hybrid_path = "output/diffusion_hybrid_bool.npz"   # or None
 ssa_path = "output/diffusion_SSA.npz"                           # or None
 pde_path = "output/diffusion_PDE.npz"                           # or None
 
