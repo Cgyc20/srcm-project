@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-class Reaction:
+class SSAReaction:
     """
     Stores reactions, species, stoichiometry, and reaction types.
     Automatically calculates stoichiometric matrix and labels when reactions are added.

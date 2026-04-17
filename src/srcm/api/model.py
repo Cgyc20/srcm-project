@@ -12,9 +12,11 @@ from ..hybrid_solver import (
     SimulationResults,
     SRCMEngine,
 )
+from ..ssa_solver import (
+    SSAEngine,
+    SSAReaction
+)
 
-# Later, when your pure SSA backend is in place, import it here, e.g.
-# from ..ssa_solver import SSAEngine, SSAReactionSystem
 
 UserRHSFn = Callable[..., Union[Sequence[np.ndarray], np.ndarray]]
 
@@ -26,43 +28,7 @@ class SRCMModel:
 
     Supports:
       - mode="hybrid"
-      - mode="ssa"   (backend hook prepared; plug in your pure stochastic solver)
-
-    Public usage
-    ------------
-    model = SRCMModel(["U", "V"], boundary="zero-flux")
-
-    model.diffusion(U=0.1, V=0.2)
-    model.rates(r_11=1.0, r_12=0.5, r_2=2.0, r_3=0.1)
-
-    model.reaction({"U": 2}, {"U": 3}, rate="r_11")
-    model.reaction({"U": 2}, {"U": 2, "V": 1}, rate="r_12")
-    model.reaction({"U": 1, "V": 1}, {"V": 1}, rate="r_2")
-    model.reaction({"V": 1}, {}, rate="r_3")
-
-    model.conversion(
-        threshold={"U": [20, 30], "V": [10, 15]},
-        rate=1.0,
-        removal="prob",
-    )
-
-    model.pde(lambda U, V, r: (
-        r["r_12"] * U**2 - r["r_2"] * U * V,
-        r["r_2"] * U * V - r["r_3"] * V,
-    ))
-
-    results, meta = model.run(
-        mode="hybrid",
-        L=25.0,
-        K=100,
-        pde_multiple=4,
-        total_time=100.0,
-        dt=0.1,
-        init_counts={"U": U0, "V": V0},
-        repeats=100,
-        output="mean",
-        parallel=True,
-    )
+      - mode="ssa"
     """
 
     species: List[str]
@@ -351,17 +317,31 @@ class SRCMModel:
             cd_removal_mode="probabilistic" if self._removal_mode == "prob" else "standard",
         )
 
+    def _build_ssa_reaction_system(self) ->SSAReaction:
+        """
+        Build the pure SSA reaction system from neutral reaction specs.
+        """
+        rs =SSAReaction()
+
+        for spec in self._reaction_specs:
+            rate_name = spec["rate_name"]
+            if rate_name not in self._reaction_rates:
+                raise ValueError(f"Missing numeric rate for reaction rate '{rate_name}'")
+
+            rs.add_reaction(
+                reactants=spec["reactants"],
+                products=spec["products"],
+                reaction_rate=float(self._reaction_rates[rate_name]),
+            )
+
+        return rs
+
     def _build_ssa_backend(
         self,
         *,
         L: float,
         K: int,
-    ):
-        """
-        Hook for your pure stochastic backend.
-
-        Replace this with construction of your SSA reaction system + engine.
-        """
+    ) -> SSAEngine:
         self._require_ssa_ready()
 
         domain = Domain(
@@ -371,9 +351,12 @@ class SRCMModel:
             boundary=str(self.boundary),
         )
 
-        raise NotImplementedError(
-            "SSA backend not yet wired in. Next step: build Reaction/SSA engine "
-            "from self._reaction_specs and return an object matching the run API."
+        reactions = self._build_ssa_reaction_system()
+
+        return SSAEngine(
+            reaction_system=reactions,
+            diffusion_rates=self._diffusion_rates,  # type: ignore[arg-type]
+            domain=domain,
         )
 
     def _coerce_init_counts(
@@ -480,7 +463,7 @@ class SRCMModel:
         Notes
         -----
         - For mode="hybrid", conversion(...) and pde(...) must be configured.
-        - For mode="ssa", those are ignored, and the pure stochastic backend is used.
+        - For mode="ssa", conversion(...) and pde(...) are ignored.
         """
         if mode not in ("hybrid", "ssa"):
             raise ValueError("mode must be one of: 'hybrid', 'ssa'")
@@ -488,17 +471,75 @@ class SRCMModel:
             raise ValueError("output must be one of: 'single', 'mean', 'trajectories', 'final'")
 
         if mode == "ssa":
-            # prepare shape-checked counts
-            ssa0 = self._coerce_init_counts(init_counts, K=int(K))
+            engine = self._build_ssa_backend(L=L, K=K)
+            domain = engine.domain
 
-            # pure SSA backend hook
-            backend = self._build_ssa_backend(L=L, K=K)
+            ssa0 = self._coerce_init_counts(init_counts, K=domain.K)
 
-            # once wired in, backend should mirror the hybrid backend interface
-            # keeping this explicit for now
-            raise NotImplementedError(
-                "SSA run path is prepared, but backend calls still need wiring."
+            if output == "single":
+                res = engine.run(
+                    initial_ssa=ssa0,
+                    initial_pde=None,
+                    time=float(total_time),
+                    dt=float(dt),
+                    seed=int(seed),
+                )
+                return res, self.metadata(mode=mode, domain=domain, output=output, repeats=1)
+
+            if output == "mean":
+                if repeats <= 0:
+                    raise ValueError("repeats must be > 0 for output='mean'")
+                res = engine.run_repeats(
+                    initial_ssa=ssa0,
+                    initial_pde=None,
+                    time=float(total_time),
+                    dt=float(dt),
+                    repeats=int(repeats),
+                    seed=int(seed),
+                    parallel=bool(parallel),
+                    n_jobs=int(n_jobs),
+                    prefer=str(prefer),
+                    progress=bool(progress),
+                )
+                return res, self.metadata(mode=mode, domain=domain, output=output, repeats=int(repeats))
+
+            if output == "trajectories":
+                if repeats <= 0:
+                    raise ValueError("repeats must be > 0 for output='trajectories'")
+                res = engine.run_trajectories(
+                    initial_ssa=ssa0,
+                    initial_pde=None,
+                    time=float(total_time),
+                    dt=float(dt),
+                    repeats=int(repeats),
+                    seed=int(seed),
+                    parallel=bool(parallel),
+                    n_jobs=int(n_jobs),
+                    prefer=str(prefer),
+                    progress=bool(progress),
+                )
+                return res, self.metadata(mode=mode, domain=domain, output=output, repeats=int(repeats))
+
+            if repeats <= 0:
+                raise ValueError("repeats must be > 0 for output='final'")
+            final_ssa, final_pde, t_final = engine.run_repeats_final(
+                initial_ssa=ssa0,
+                initial_pde=None,
+                time=float(total_time),
+                dt=float(dt),
+                repeats=int(repeats),
+                seed=int(seed),
+                parallel=bool(parallel),
+                n_jobs=int(n_jobs),
+                prefer=str(prefer),
+                progress=bool(progress),
+                save_path=None,
             )
+            return (
+                final_ssa,
+                final_pde,
+                t_final,
+            ), self.metadata(mode=mode, domain=domain, output=output, repeats=int(repeats))
 
         # hybrid mode
         engine = self._build_hybrid_engine(L=L, K=K, pde_multiple=pde_multiple)

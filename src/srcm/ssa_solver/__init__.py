@@ -1,4 +1,4 @@
-from .reaction import Reaction
-from .stochastic_sim import SSA
+from .reaction import SSAReaction
+from .stochastic_sim import SSAEngine
 
-__all__ = ["Reaction", "SSA"]
+__all__ = ["SSAReaction", "SSAEngine"]

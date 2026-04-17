@@ -18,6 +18,7 @@ def main():
     model.reaction({}, {"U": 1}, rate="alpha")
     model.reaction({"U": 1}, {}, rate="beta")
 
+    # Hybrid-only ingredients
     model.conversion(
         threshold={"U": [10, 20]},
         rate=1.0,
@@ -25,19 +26,25 @@ def main():
     )
 
     model.pde(lambda U, r: (
-        r["alpha"] - r["beta"] * U,
+        - r["beta"] * U,
     ))
 
     init_U = np.zeros(K, dtype=int)
     init_U[K // 2 - 3:K // 2 + 3] = 40
 
-    results, meta = model.run(
+    init_counts = {"U": init_U}
+
+    # ------------------------------------------------------------
+    # Hybrid run
+    # ------------------------------------------------------------
+    hybrid_results, hybrid_meta = model.run(
+        mode="hybrid",
         L=30.0,
         K=K,
         pde_multiple=4,
         total_time=60.0,
         dt=0.1,
-        init_counts={"U": init_U},
+        init_counts=init_counts,
         repeats=100,
         output="mean",
         parallel=True,
@@ -45,12 +52,36 @@ def main():
     )
 
     ResultsIO.save(
-        results=results,
-        path="output/production_degradation_prob.npz",
-        meta=meta,
+        results=hybrid_results,
+        path="output/production_degradation_hybrid_prob.npz",
+        meta=hybrid_meta,
     )
 
-    print("Saved output/production_degradation_prob.npz")
+    print("Saved output/production_degradation_hybrid_prob.npz")
+
+    # ------------------------------------------------------------
+    # Pure SSA run
+    # ------------------------------------------------------------
+    ssa_results, ssa_meta = model.run(
+        mode="ssa",
+        L=30.0,
+        K=K,
+        total_time=60.0,
+        dt=0.1,
+        init_counts=init_counts,
+        repeats=100,
+        output="mean",
+        parallel=True,
+        progress=True,
+    )
+
+    ResultsIO.save(
+        results=ssa_results,
+        path="output/production_degradation_ssa.npz",
+        meta=ssa_meta,
+    )
+
+    print("Saved output/production_degradation_ssa.npz")
 
 
 if __name__ == "__main__":
