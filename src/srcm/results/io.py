@@ -107,6 +107,44 @@ def _ensure_pde_for_trajectories(res: SimulationResults) -> np.ndarray:
     return np.zeros((R, S, n_pde, T), dtype=float)
 
 
+def _normalise_reaction_scheme(reaction_scheme: Any) -> list[dict[str, Any]]:
+    """
+    Convert a reaction scheme into a JSON-safe list of dicts.
+
+    Supported inputs:
+      - list[dict]
+      - list[dataclass]
+      - any iterable of objects with attributes like:
+          reactants, products, rate_name, rate
+    """
+    if reaction_scheme is None:
+        return []
+
+    out: list[dict[str, Any]] = []
+
+    for r in reaction_scheme:
+        if isinstance(r, dict):
+            out.append(_json_safe(r))
+            continue
+
+        if is_dataclass(r):
+            out.append(_json_safe(asdict(r)))
+            continue
+
+        item: dict[str, Any] = {}
+
+        for attr in ("reactants", "products", "rate_name", "rate"):
+            if hasattr(r, attr):
+                item[attr] = _json_safe(getattr(r, attr))
+
+        if not item:
+            item = {"repr": repr(r)}
+
+        out.append(item)
+
+    return out
+
+
 class ResultsIO:
     """
     Unified save/load wrapper for SRCM results.
@@ -133,6 +171,7 @@ class ResultsIO:
         species: Optional[list[str]] = None,
         meta: Optional[Dict[str, Any]] = None,
         result_kind: Optional[str] = None,
+        reaction_scheme: Optional[Any] = None,
     ) -> None:
         """
         Save either:
@@ -145,11 +184,20 @@ class ResultsIO:
           - valid domain/species
 
         A zero PDE array will be materialised automatically for consistency.
+
+        Parameters
+        ----------
+        reaction_scheme
+            Optional serialisable reaction description to store in meta_json
+            under the key "reactions".
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
         meta_out: Dict[str, Any] = dict(meta or {})
+
+        if reaction_scheme is not None and "reactions" not in meta_out:
+            meta_out["reactions"] = _normalise_reaction_scheme(reaction_scheme)
 
         # ------------------------------------------------------------
         # Standard SimulationResults save path
@@ -172,8 +220,6 @@ class ResultsIO:
             else:
                 raise ValueError(f"Unsupported inferred result kind '{kind}'")
 
-            # If caller didn't specify mode, infer a decent default:
-            # pde originally None -> likely SSA
             if "mode" not in meta_out:
                 meta_out["mode"] = "ssa" if getattr(results, "pde", None) is None else "hybrid"
 
@@ -294,6 +340,7 @@ class ResultsIO:
         domain: Optional[Domain] = None,
         species: Optional[list[str]] = None,
         meta: Optional[Dict[str, Any]] = None,
+        reaction_scheme: Optional[Any] = None,
     ) -> None:
         """
         Thin convenience wrapper for engine outputs.
@@ -303,7 +350,12 @@ class ResultsIO:
           - final_tuple=(final_ssa, final_pde, t_final)
         """
         if results is not None:
-            ResultsIO.save(results=results, path=path, meta=meta)
+            ResultsIO.save(
+                results=results,
+                path=path,
+                meta=meta,
+                reaction_scheme=reaction_scheme,
+            )
             return
 
         if final_tuple is not None:
@@ -318,6 +370,7 @@ class ResultsIO:
                 domain=domain,
                 species=species,
                 meta=meta,
+                reaction_scheme=reaction_scheme,
             )
             return
 
