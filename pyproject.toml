@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Spatial simulation framework"
 requires-python = ">=3.10"
 dependencies = [
+    "joblib>=1.5.3",
     "numpy",
 ]
 
