@@ -505,7 +505,6 @@ class SRCMEngine:
         """
         Run one simulation and return full time series results.
         """
-        from srcm_engine.results import SimulationResults
 
         if time <= 0:
             raise ValueError("time must be > 0")
