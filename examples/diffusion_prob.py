@@ -29,6 +29,7 @@ def main():
     init_U[centre] = 200
 
     results, meta = model.run(
+        mode="hybrid",
         L=25.0,
         K=K,
         pde_multiple=4,
@@ -51,6 +52,28 @@ def main():
     print("Saved to output/diffusion_one_species_central_peak.npz")
     print("SSA shape:", results.ssa.shape)
     print("PDE shape:", results.pde.shape)
+
+
+    ssa_results, ssa_meta = model.run(
+        mode="ssa",
+        L=25.0,
+        K=K,
+        total_time=50.0,
+        dt=0.1,
+        init_counts={"U": init_U},
+        repeats=100,
+        output="mean",
+        parallel=True,
+        progress=True,
+    )
+
+    ResultsIO.save(
+        results=ssa_results,
+        path="output/diffusion_SSA.npz",
+        meta=ssa_meta,
+    )
+
+    print("output/diffusion_SSA.npz")
 
 
 if __name__ == "__main__":

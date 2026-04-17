@@ -11,8 +11,8 @@ INTERVAL_MS = 40
 BLIT = False
 REPEAT = True
 
-hybrid_path = "output/production_degradation_hybrid_prob.npz"   # or None
-ssa_path = "output/production_degradation_ssa.npz"              # or None
+hybrid_path = "output/diffusion_one_species_central_peak.npz"   # or None
+ssa_path = "output/diffusion_SSA.npz"              # or None
 
 if hybrid_path is None and ssa_path is None:
     raise ValueError("At least one of hybrid_path or ssa_path must be provided.")

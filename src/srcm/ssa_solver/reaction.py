@@ -8,13 +8,24 @@ class SSAReaction:
     Can be passed directly into an SSA simulator.
     """
 
-    def __init__(self):
-        """Initialize an empty reaction system."""
+    def __init__(self, species_list=None):
         self.reaction_set = []
-        self.species_list = []
-        self.stoichiometric_matrix = None
-        self.stoichiometric_df = None
+        self.species_list = list(species_list) if species_list is not None else []
+
+        # ALWAYS define these
+        self.species_index = {s: i for i, s in enumerate(self.species_list)}
+        self.number_of_species = len(self.species_list)
+        self.number_of_reactions = 0
+
+        # zero-reaction stoichiometry
+        self.stoichiometric_matrix = np.zeros((self.number_of_species, 0), dtype=int)
+
         self.reaction_labels = []
+        self.stoichiometric_df = pd.DataFrame(
+            self.stoichiometric_matrix,
+            index=self.species_list,
+            columns=[]
+        )
 
     def add_reaction(self, reactants: dict, products: dict, reaction_rate: float):
         """
@@ -63,7 +74,7 @@ class SSAReaction:
     def _update_stoichiometry(self):
         """Automatically recalculate species list and stoichiometric matrix."""
         # Species
-        species_set = set()
+        species_set = set(self.species_list)  # keep existing species
         for r in self.reaction_set:
             species_set.update(r["reactants"].keys())
             species_set.update(r["products"].keys())

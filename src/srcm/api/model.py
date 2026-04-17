@@ -144,8 +144,6 @@ class SRCMModel:
 
     def _require_ssa_ready(self) -> None:
         self._require_diffusion()
-        if len(self._reaction_specs) == 0:
-            raise ValueError("At least one reaction(...) must be set before run(mode='ssa')")
 
     def _normalise_per_species(
         self,
@@ -321,7 +319,7 @@ class SRCMModel:
         """
         Build the pure SSA reaction system from neutral reaction specs.
         """
-        rs =SSAReaction()
+        rs = SSAReaction(species_list=list(self.species))
 
         for spec in self._reaction_specs:
             rate_name = spec["rate_name"]
