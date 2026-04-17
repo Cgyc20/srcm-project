@@ -7,15 +7,16 @@ from matplotlib.animation import FuncAnimation
 # Settings
 # ------------------------------------------------------------
 STRIDE = 5
-INTERVAL_MS = 40
+INTERVAL_MS = 200
 BLIT = False
 REPEAT = True
 
 hybrid_path = "output/diffusion_one_species_central_peak.npz"   # or None
-ssa_path = "output/diffusion_SSA.npz"              # or None
+ssa_path = "output/diffusion_SSA.npz"                           # or None
+pde_path = "output/diffusion_PDE.npz"                           # or None
 
-if hybrid_path is None and ssa_path is None:
-    raise ValueError("At least one of hybrid_path or ssa_path must be provided.")
+if hybrid_path is None and ssa_path is None and pde_path is None:
+    raise ValueError("At least one of hybrid_path, ssa_path, or pde_path must be provided.")
 
 # ------------------------------------------------------------
 # Helpers
@@ -64,6 +65,56 @@ def get_thresholds_for_species(threshold_meta, species_name):
         return v, v
 
     return None, None
+
+def ensure_TN(arr, N_expected):
+    """
+    Force PDE array to shape (T, N).
+    Accepts either (T, N) or (N, T).
+    """
+    arr = np.asarray(arr)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D array, got {arr.shape}")
+
+    T, N = arr.shape
+    if N == N_expected:
+        return arr
+    if T == N_expected:
+        return arr.T
+
+    raise ValueError(f"Array shape {arr.shape} doesn't match expected spatial size N={N_expected}")
+
+def find_one_species_array(npz):
+    """
+    Try likely keys for one-species PDE data.
+    """
+    keys = set(npz.files)
+    candidates = [
+        "u_record", "u_rec", "u", "U",
+        "record", "solution"
+    ]
+    for k in candidates:
+        if k in keys:
+            return np.asarray(npz[k])
+
+    raise KeyError(f"Could not find one-species PDE array in keys: {npz.files}")
+
+def find_multi_species_arrays(npz, n_species_expected):
+    """
+    Try likely key pairs for multi-species PDE data.
+    """
+    keys = set(npz.files)
+    candidate_lists = [
+        ["u_record", "v_record"],
+        ["U", "V"],
+        ["u", "v"],
+        ["A", "B"],
+    ]
+
+    for pair in candidate_lists:
+        if len(pair) >= n_species_expected and all(k in keys for k in pair[:n_species_expected]):
+            return [np.asarray(npz[k]) for k in pair[:n_species_expected]]
+
+    raise KeyError(f"Could not find {n_species_expected} PDE species arrays in keys: {npz.files}")
 
 # ------------------------------------------------------------
 # Load hybrid data (optional)
@@ -127,13 +178,89 @@ if ssa_path is not None:
         species_names = ssa_meta.get("species", [f"Species {i}" for i in range(n_species)])
 
     else:
-        # basic compatibility checks
         if pure_ssa.shape[0] != n_species:
             raise ValueError("SSA and hybrid files have different numbers of species")
         if pure_ssa.shape[1] != n_ssa:
             raise ValueError("SSA and hybrid files have different n_ssa")
         if pure_ssa.shape[2] != T:
             raise ValueError("SSA and hybrid files have different number of time points")
+
+# ------------------------------------------------------------
+# Load pure PDE data (optional)
+# ------------------------------------------------------------
+pde_meta = {}
+pde_data = None
+pure_pde = None        # shape: (S, T_pde, N_pde)
+time_pde = None
+
+if pde_path is not None:
+    pde_data, pde_meta = load_npz_with_meta(pde_path)
+
+    # if no hybrid/ssa file set canonical geometry, try to infer it from PDE file
+    if domain_length is None:
+        if "L" not in pde_data.files:
+            raise ValueError("Pure PDE file must contain 'L' if hybrid/ssa file is absent")
+        domain_length = float(np.asarray(pde_data["L"]).item())
+
+    if n_pde is None:
+        if "x" in pde_data.files:
+            x_pde_tmp = np.asarray(pde_data["x"])
+            n_pde = len(x_pde_tmp)
+        elif "n" in pde_data.files:
+            n_pde = int(np.asarray(pde_data["n"]).item())
+        else:
+            raise ValueError("Could not infer n_pde from PDE file")
+
+    if n_species is None:
+        # infer from available arrays
+        pde_keys = set(pde_data.files)
+        if any(k in pde_keys for k in ["v_record", "V", "v"]):
+            n_species = 2
+            species_names = ["U", "V"] if species_names is None else species_names
+        else:
+            n_species = 1
+            species_names = ["U"] if species_names is None else species_names
+
+    if n_ssa is None and pde_multiple is None:
+        # no SSA/hybrid reference grid, so fake an SSA grid equal to PDE grid for plotting compatibility
+        n_ssa = n_pde
+        pde_multiple = 1
+
+    if len(species_names) != n_species:
+        species_names = [f"Species {i}" for i in range(n_species)]
+
+    if n_species == 1:
+        U_raw = find_one_species_array(pde_data)
+        U_TN = ensure_TN(U_raw, n_pde)   # (T, N)
+        pure_pde = U_TN[None, :, :]      # (1, T, N)
+    else:
+        raw_list = find_multi_species_arrays(pde_data, n_species)
+        pure_pde = np.stack([ensure_TN(arr, n_pde) for arr in raw_list], axis=0)  # (S, T, N)
+
+    if "timevector" in pde_data.files:
+        time_pde = np.asarray(pde_data["timevector"])
+    elif "time" in pde_data.files:
+        time_pde = np.asarray(pde_data["time"])
+    elif "t" in pde_data.files:
+        time_pde = np.asarray(pde_data["t"])
+    elif "dt" in pde_data.files:
+        dtp = float(np.asarray(pde_data["dt"]).item())
+        time_pde = np.arange(pure_pde.shape[1]) * dtp
+
+    if time is None:
+        if time_pde is None:
+            raise ValueError("Could not infer time vector from PDE file")
+        time = time_pde.copy()
+        T = len(time)
+
+# ------------------------------------------------------------
+# Compatibility checks for pure PDE
+# ------------------------------------------------------------
+if pure_pde is not None:
+    if pure_pde.shape[0] != n_species:
+        raise ValueError("Pure PDE and other data have different numbers of species")
+    if pure_pde.shape[2] != n_pde:
+        raise ValueError("Pure PDE and hybrid grid have different n_pde")
 
 # ------------------------------------------------------------
 # Grid setup
@@ -159,6 +286,14 @@ def combined_density_on_ssa(species_idx, frame):
     combined_mass = ssa_mass + pde_mass_blocks
     return combined_mass / h_ssa
 
+def map_time_to_pde_frame(frame):
+    if pure_pde is None:
+        return None
+    if time_pde is None:
+        return int(np.clip(frame, 0, pure_pde.shape[1] - 1))
+    t = float(time[frame])
+    return int(np.argmin(np.abs(time_pde - t)))
+
 # ------------------------------------------------------------
 # y-limits
 # ------------------------------------------------------------
@@ -176,6 +311,9 @@ for s in range(n_species):
 
     if pure_ssa_density is not None:
         vals.append(float(pure_ssa_density[s].max()))
+
+    if pure_pde is not None:
+        vals.append(float(pure_pde[s].max()))
 
     if hybrid_ssa is not None and hybrid_pde is not None:
         vals.append(max(float(combined_density_on_ssa(s, k).max()) for k in probe_frames))
@@ -202,13 +340,16 @@ if hybrid_path is not None:
     title_bits.append("Hybrid")
 if ssa_path is not None:
     title_bits.append("SSA")
+if pde_path is not None:
+    title_bits.append("PDE")
 
 fig.suptitle(" + ".join(title_bits) + " animation", fontsize=16)
 
 bars_hybrid_ssa_list = []
 bars_pure_ssa_list = []
 bars_combined_list = []
-line_pde_list = []
+line_hybrid_pde_list = []
+line_pure_pde_list = []
 time_text_list = []
 cd_line_list = []
 dc_line_list = []
@@ -260,7 +401,7 @@ for s in range(n_species):
 
     # Hybrid PDE line
     if hybrid_pde is not None:
-        line_pde, = ax.plot(
+        line_hybrid_pde, = ax.plot(
             pde_x,
             hybrid_pde[s, :, 0],
             linestyle="--",
@@ -268,7 +409,20 @@ for s in range(n_species):
             label="Hybrid PDE",
         )
     else:
-        line_pde = None
+        line_hybrid_pde = None
+
+    # Pure PDE line
+    if pure_pde is not None:
+        fp0 = map_time_to_pde_frame(0)
+        line_pure_pde, = ax.plot(
+            pde_x,
+            pure_pde[s, fp0, :],
+            linestyle="-",
+            linewidth=2,
+            label="Pure PDE",
+        )
+    else:
+        line_pure_pde = None
 
     # Threshold lines (hybrid metadata only)
     if threshold_meta is not None:
@@ -320,7 +474,8 @@ for s in range(n_species):
     bars_hybrid_ssa_list.append(bars_hybrid_ssa)
     bars_pure_ssa_list.append(bars_pure_ssa)
     bars_combined_list.append(bars_combined)
-    line_pde_list.append(line_pde)
+    line_hybrid_pde_list.append(line_hybrid_pde)
+    line_pure_pde_list.append(line_pure_pde)
     time_text_list.append(time_text)
     cd_line_list.append(cd_line)
     dc_line_list.append(dc_line)
@@ -332,6 +487,7 @@ frames = list(range(0, T, max(1, int(STRIDE))))
 
 def update(frame):
     artists = []
+    frame_p = map_time_to_pde_frame(frame)
 
     for s in range(n_species):
         # Hybrid SSA
@@ -342,7 +498,8 @@ def update(frame):
 
         # Pure SSA
         if bars_pure_ssa_list[s] is not None:
-            for bar, h in zip(bars_pure_ssa_list[s], pure_ssa_density[s, :, frame]):
+            frame_s = min(frame, pure_ssa_density.shape[2] - 1)
+            for bar, h in zip(bars_pure_ssa_list[s], pure_ssa_density[s, :, frame_s]):
                 bar.set_height(float(h))
                 artists.append(bar)
 
@@ -353,10 +510,15 @@ def update(frame):
                 bar.set_height(float(h))
                 artists.append(bar)
 
-        # PDE line
-        if line_pde_list[s] is not None:
-            line_pde_list[s].set_ydata(hybrid_pde[s, :, frame])
-            artists.append(line_pde_list[s])
+        # Hybrid PDE
+        if line_hybrid_pde_list[s] is not None:
+            line_hybrid_pde_list[s].set_ydata(hybrid_pde[s, :, frame])
+            artists.append(line_hybrid_pde_list[s])
+
+        # Pure PDE
+        if line_pure_pde_list[s] is not None and frame_p is not None:
+            line_pure_pde_list[s].set_ydata(pure_pde[s, frame_p, :])
+            artists.append(line_pure_pde_list[s])
 
         # time
         time_text_list[s].set_text(f"t = {time[frame]:.3f}")

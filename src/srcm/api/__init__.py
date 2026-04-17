@@ -1,3 +1,3 @@
 from .model import SRCMModel
-
-__all__ = ["SRCMModel"] 
+from .pde_model import PDEModel
+__all__ = ["SRCMModel", "PDEModel"] 

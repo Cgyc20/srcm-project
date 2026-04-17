@@ -2,9 +2,11 @@ from srcm.hybrid_solver import Domain, ConversionParams, MassProjector, SSADiffu
 
 from srcm.results import ResultsIO
 
-from srcm.api import SRCMModel
+from srcm.api import SRCMModel, PDEModel
 
 from srcm.ssa_solver import SSAEngine, SSAReaction
+
+
 __all__ = [
             "Domain",
             "ConversionParams",
@@ -21,4 +23,5 @@ __all__ = [
             "SimulationResults",
             "SRCMModel",
             "SSAReaction",
-            "SSAEngine"]
+            "SSAEngine",
+            "PDEModel"]
