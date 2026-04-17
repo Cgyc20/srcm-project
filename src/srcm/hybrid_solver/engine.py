@@ -57,7 +57,10 @@ class SRCMEngine:
 
         # Useful mappings
         self._sp_to_idx = {sp: i for i, sp in enumerate(self.reactions.species)}
-
+        
+        #Mass calculatiion class
+        self.MassProj = MassProjector(pde_multiple=self.domain.pde_multiple,dx=self.domain.dx, h = self.domain.h)
+        
     # ------------------------------------------------------------------
     # PDE RHS: diffusion + reaction terms
     # ------------------------------------------------------------------
@@ -405,14 +408,14 @@ class SRCMEngine:
 
         while t0 < t1:
             # masses + masks
-            MassProj = MassProjector(pde_multiple=self.domain.pde_multiple,dx=self.domain.dx, h = self.domain.h)
+           
 
 
-            comb, pde_mass = MassProj.get_combined_total_mass(ssa_counts=state.ssa, pde_conc=state.pde)
+            comb, pde_mass = self.MassProj.get_combined_total_mass(ssa_counts=state.ssa, pde_conc=state.pde)
             DC_mask = self.conversion.DC_mask(comb)
             CD_mask = self.conversion.CD_mask(comb)
 
-            sufficient = MassProj.get_high_concentration_mask(pde_conc=state.pde)
+            sufficient = self.MassProj.get_high_concentration_mask(pde_conc=state.pde)
 
             # propensities
             self.build_propensity_vector(
