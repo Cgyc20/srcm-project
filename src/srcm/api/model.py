@@ -5,8 +5,16 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 
-from ..hybrid_solver import Domain, ConversionParams, HybridReactionSystem, SimulationResults, SRCMEngine
+from ..hybrid_solver import (
+    Domain,
+    ConversionParams,
+    HybridReactionSystem,
+    SimulationResults,
+    SRCMEngine,
+)
 
+# Later, when your pure SSA backend is in place, import it here, e.g.
+# from ..ssa_solver import SSAEngine, SSAReactionSystem
 
 UserRHSFn = Callable[..., Union[Sequence[np.ndarray], np.ndarray]]
 
@@ -14,10 +22,14 @@ UserRHSFn = Callable[..., Union[Sequence[np.ndarray], np.ndarray]]
 @dataclass
 class SRCMModel:
     """
-    User-facing API for building and running SRCM hybrid models.
+    User-facing API for building and running SRCM models.
 
-    Typical usage
-    -------------
+    Supports:
+      - mode="hybrid"
+      - mode="ssa"   (backend hook prepared; plug in your pure stochastic solver)
+
+    Public usage
+    ------------
     model = SRCMModel(["U", "V"], boundary="zero-flux")
 
     model.diffusion(U=0.1, V=0.2)
@@ -40,6 +52,7 @@ class SRCMModel:
     ))
 
     results, meta = model.run(
+        mode="hybrid",
         L=25.0,
         K=100,
         pde_multiple=4,
@@ -58,7 +71,9 @@ class SRCMModel:
     _diffusion_rates: Optional[Dict[str, float]] = None
     _reaction_rates: Dict[str, float] = field(default_factory=dict)
     _rhs_user: Optional[UserRHSFn] = None
-    _reactions: Optional[HybridReactionSystem] = None
+
+    # store user reactions neutrally, not as a hybrid-specific object
+    _reaction_specs: List[Dict[str, Any]] = field(default_factory=list)
 
     _conversion_threshold: Any = None
     _conversion_rate: Any = None
@@ -71,8 +86,6 @@ class SRCMModel:
             raise ValueError("species must be unique")
         if self.boundary not in ("zero-flux", "periodic"):
             raise ValueError("boundary must be 'zero-flux' or 'periodic'")
-
-        self._reactions = HybridReactionSystem(species=list(self.species))
 
     # ------------------------------------------------------------------
     # configuration
@@ -101,20 +114,14 @@ class SRCMModel:
         rate: str,
         label: Optional[str] = None,
     ) -> "SRCMModel":
-        if self._reactions is None:
-            raise RuntimeError("Internal reaction system not initialised")
-
-        # add_reaction_original stores symbolic rate_name and can later be filled numerically
-        self._reactions.add_reaction_original(
-            reactants=reactants,
-            products=products,
-            rate=0.0,
-            rate_name=str(rate),
+        self._reaction_specs.append(
+            {
+                "reactants": dict(reactants),
+                "products": dict(products),
+                "rate_name": str(rate),
+                "label": label,
+            }
         )
-
-        # If your reaction system supports labels directly, wire that in there instead.
-        # For now, label is accepted for API consistency.
-        _ = label
         return self
 
     def conversion(
@@ -158,22 +165,27 @@ class SRCMModel:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
-    def _require_ready(self) -> None:
+    def _require_diffusion(self) -> None:
         if self._diffusion_rates is None:
             raise ValueError("diffusion(...) must be set before run()")
+
+    def _require_hybrid_ready(self) -> None:
+        self._require_diffusion()
         if self._rhs_user is None:
-            raise ValueError("pde(...) must be set before run()")
+            raise ValueError("pde(...) must be set before run(mode='hybrid')")
         if self._conversion_threshold is None:
-            raise ValueError("conversion(...) must be set before run()")
-        if self._reactions is None:
-            raise RuntimeError("Internal reaction system not initialised")
+            raise ValueError("conversion(...) must be set before run(mode='hybrid')")
+
+    def _require_ssa_ready(self) -> None:
+        self._require_diffusion()
+        if len(self._reaction_specs) == 0:
+            raise ValueError("At least one reaction(...) must be set before run(mode='ssa')")
 
     def _normalise_per_species(
         self,
         x: Any,
         *,
         name: str,
-        allow_pairs: bool = False,
     ) -> float | List[float]:
         if isinstance(x, (int, float, np.integer, np.floating)):
             return float(x)
@@ -185,9 +197,6 @@ class SRCMModel:
                 raise ValueError(f"Missing {name} for species: {missing}")
             if extra:
                 raise ValueError(f"Unknown species in {name}: {extra}")
-
-            if allow_pairs and all(isinstance(x[sp], (list, tuple, np.ndarray)) for sp in self.species):
-                return x  # handled elsewhere
             return [float(x[sp]) for sp in self.species]
 
         if isinstance(x, (list, tuple, np.ndarray)):
@@ -201,7 +210,6 @@ class SRCMModel:
         thr = self._conversion_threshold
         rate = self._conversion_rate
 
-        # Single threshold per species -> use same value for both CD and DC
         if isinstance(thr, dict):
             missing = [sp for sp in self.species if sp not in thr]
             extra = [sp for sp in thr.keys() if sp not in self.species]
@@ -233,11 +241,9 @@ class SRCMModel:
 
         elif isinstance(thr, (list, tuple, np.ndarray)):
             if len(thr) == 2 and all(isinstance(v, (int, float, np.integer, np.floating)) for v in thr):
-                # global [CD, DC]
                 cd = float(thr[0])
                 dc = float(thr[1])
             elif len(thr) == len(self.species):
-                # single threshold per species
                 vals = [float(v) for v in thr]
                 cd = vals
                 dc = vals
@@ -292,9 +298,7 @@ class SRCMModel:
 
             out = tuple(out)
             if len(out) != n:
-                raise ValueError(
-                    f"pde(...) returned {len(out)} outputs, expected {n}"
-                )
+                raise ValueError(f"pde(...) returned {len(out)} outputs, expected {n}")
 
             arr = np.array(out, dtype=float)
             if arr.shape != C.shape:
@@ -305,37 +309,71 @@ class SRCMModel:
 
         return pde_terms
 
-    def _update_reaction_rates_on_system(self) -> None:
-        if self._reactions is None:
-            raise RuntimeError("Internal reaction system not initialised")
+    def _build_hybrid_reaction_system(self) -> HybridReactionSystem:
+        rs = HybridReactionSystem(species=list(self.species))
 
-        for rec in getattr(self._reactions, "pure_reactions", []):
+        for spec in self._reaction_specs:
+            rs.add_reaction_original(
+                reactants=spec["reactants"],
+                products=spec["products"],
+                rate=0.0,
+                rate_name=spec["rate_name"],
+            )
+
+        for rec in getattr(rs, "pure_reactions", []):
             rn = rec.get("rate_name", None)
             if rn is not None and rn in self._reaction_rates:
                 rec["rate"] = float(self._reaction_rates[rn])
 
-    def _build_engine(
+        return rs
+
+    def _build_hybrid_engine(
         self,
         *,
         L: float,
         K: int,
         pde_multiple: int,
     ) -> SRCMEngine:
-        self._require_ready()
-        self._update_reaction_rates_on_system()
+        self._require_hybrid_ready()
 
         domain = self._build_domain(L=L, K=K, pde_multiple=pde_multiple)
         conversion = self._build_conversion()
         pde_terms = self._build_pde_terms()
+        reactions = self._build_hybrid_reaction_system()
 
         return SRCMEngine(
-            reactions=self._reactions,  # type: ignore[arg-type]
+            reactions=reactions,
             pde_reaction_terms=pde_terms,
             diffusion_rates=self._diffusion_rates,  # type: ignore[arg-type]
             domain=domain,
             conversion=conversion,
             reaction_rates=dict(self._reaction_rates),
             cd_removal_mode="probabilistic" if self._removal_mode == "prob" else "standard",
+        )
+
+    def _build_ssa_backend(
+        self,
+        *,
+        L: float,
+        K: int,
+    ):
+        """
+        Hook for your pure stochastic backend.
+
+        Replace this with construction of your SSA reaction system + engine.
+        """
+        self._require_ssa_ready()
+
+        domain = Domain(
+            length=float(L),
+            n_ssa=int(K),
+            pde_multiple=1,
+            boundary=str(self.boundary),
+        )
+
+        raise NotImplementedError(
+            "SSA backend not yet wired in. Next step: build Reaction/SSA engine "
+            "from self._reaction_specs and return an object matching the run API."
         )
 
     def _coerce_init_counts(
@@ -415,6 +453,7 @@ class SRCMModel:
     def run(
         self,
         *,
+        mode: str = "hybrid",
         L: float,
         K: int,
         pde_multiple: int = 4,
@@ -435,16 +474,34 @@ class SRCMModel:
 
         Parameters
         ----------
+        mode : {"hybrid", "ssa"}
         output : {"single", "mean", "trajectories", "final"}
-            - "single"       -> one SimulationResults
-            - "mean"         -> averaged SimulationResults over repeats
-            - "trajectories" -> trajectory ensemble SimulationResults
-            - "final"        -> (final_ssa, final_pde, t_final)
+
+        Notes
+        -----
+        - For mode="hybrid", conversion(...) and pde(...) must be configured.
+        - For mode="ssa", those are ignored, and the pure stochastic backend is used.
         """
+        if mode not in ("hybrid", "ssa"):
+            raise ValueError("mode must be one of: 'hybrid', 'ssa'")
         if output not in ("single", "mean", "trajectories", "final"):
             raise ValueError("output must be one of: 'single', 'mean', 'trajectories', 'final'")
 
-        engine = self._build_engine(L=L, K=K, pde_multiple=pde_multiple)
+        if mode == "ssa":
+            # prepare shape-checked counts
+            ssa0 = self._coerce_init_counts(init_counts, K=int(K))
+
+            # pure SSA backend hook
+            backend = self._build_ssa_backend(L=L, K=K)
+
+            # once wired in, backend should mirror the hybrid backend interface
+            # keeping this explicit for now
+            raise NotImplementedError(
+                "SSA run path is prepared, but backend calls still need wiring."
+            )
+
+        # hybrid mode
+        engine = self._build_hybrid_engine(L=L, K=K, pde_multiple=pde_multiple)
         domain = engine.domain
 
         ssa0 = self._coerce_init_counts(init_counts, K=domain.K)
@@ -458,7 +515,7 @@ class SRCMModel:
                 dt=float(dt),
                 seed=int(seed),
             )
-            return res, self.metadata(domain=domain, output=output, repeats=1)
+            return res, self.metadata(mode=mode, domain=domain, output=output, repeats=1)
 
         if output == "mean":
             if repeats <= 0:
@@ -475,7 +532,7 @@ class SRCMModel:
                 prefer=str(prefer),
                 progress=bool(progress),
             )
-            return res, self.metadata(domain=domain, output=output, repeats=int(repeats))
+            return res, self.metadata(mode=mode, domain=domain, output=output, repeats=int(repeats))
 
         if output == "trajectories":
             if repeats <= 0:
@@ -492,9 +549,8 @@ class SRCMModel:
                 prefer=str(prefer),
                 progress=bool(progress),
             )
-            return res, self.metadata(domain=domain, output=output, repeats=int(repeats))
+            return res, self.metadata(mode=mode, domain=domain, output=output, repeats=int(repeats))
 
-        # output == "final"
         if repeats <= 0:
             raise ValueError("repeats must be > 0 for output='final'")
         final_ssa, final_pde, t_final = engine.run_repeats_final(
@@ -514,7 +570,7 @@ class SRCMModel:
             final_ssa,
             final_pde,
             t_final,
-        ), self.metadata(domain=domain, output=output, repeats=int(repeats))
+        ), self.metadata(mode=mode, domain=domain, output=output, repeats=int(repeats))
 
     # ------------------------------------------------------------------
     # metadata / inspection
@@ -522,12 +578,14 @@ class SRCMModel:
     def metadata(
         self,
         *,
+        mode: Optional[str] = None,
         domain: Optional[Domain] = None,
         output: Optional[str] = None,
         repeats: Optional[int] = None,
     ) -> dict:
         out = {
             "model": "SRCMModel",
+            "mode": mode,
             "species": list(self.species),
             "boundary": self.boundary,
             "diffusion_rates": None if self._diffusion_rates is None else dict(self._diffusion_rates),
@@ -535,6 +593,7 @@ class SRCMModel:
             "removal": self._removal_mode,
             "output": output,
             "repeats": repeats,
+            "reactions": list(self._reaction_specs),
         }
 
         if domain is not None:
@@ -553,14 +612,12 @@ class SRCMModel:
         return out
 
     def hybrid_labels(self) -> List[str]:
-        if self._reactions is None:
-            raise RuntimeError("Internal reaction system not initialised")
-        return [hr.label for hr in self._reactions.hybrid_reactions]
+        rs = self._build_hybrid_reaction_system()
+        return [hr.label for hr in rs.hybrid_reactions]
 
     def describe_reactions(self) -> None:
-        if self._reactions is None:
-            raise RuntimeError("Internal reaction system not initialised")
-        if hasattr(self._reactions, "describe_full"):
-            self._reactions.describe_full()
+        rs = self._build_hybrid_reaction_system()
+        if hasattr(rs, "describe_full"):
+            rs.describe_full()
         else:
-            self._reactions.describe()
+            rs.describe()
