@@ -98,17 +98,9 @@ class SSAEngine:
         for species_index in range(self.n_species):
             start_idx = species_index * self.K
             end_idx = (species_index + 1) * self.K
-
-            vals = self.jump_rate_list[species_index] * frame[species_index, :].astype(float)
-
-            if self.boundary_conditions == "periodic":
-                propensity_vector[start_idx:end_idx] = 2.0 * vals
-            else:  # zero-flux
-                propensity_vector[start_idx:end_idx] = 2.0 * vals
-                if self.K >= 1:
-                    propensity_vector[start_idx + 0] = vals[0]
-                if self.K >= 2:
-                    propensity_vector[start_idx + self.K - 1] = vals[-1]
+            propensity_vector[start_idx:end_idx] = (
+                self.jump_rate_list[species_index] * frame[species_index, :] * 2.0
+            )
 
         # reaction blocks
         for i, reaction in enumerate(self.reaction_set):
