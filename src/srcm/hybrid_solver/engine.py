@@ -405,15 +405,14 @@ class SRCMEngine:
 
         while t0 < t1:
             # masses + masks
-            comb, pde_mass = combined_mass(
-                state.ssa, state.pde, self.domain.pde_multiple, self.domain.dx
-            )
+            MassProj = MassProjector(pde_multiple=self.domain.pde_multiple,dx=self.domain.dx, h = self.domain.h)
+
+
+            comb, pde_mass = MassProj.get_combined_total_mass(ssa_counts=state.ssa, pde_conc=state.pde)
             DC_mask = self.conversion.DC_mask(comb)
             CD_mask = self.conversion.CD_mask(comb)
 
-            sufficient = sufficient_pde_concentration_mask(
-                state.pde, self.domain.pde_multiple, self.domain.h
-            )
+            sufficient = MassProj.get_high_concentration_mask(pde_conc=state.pde)
 
             # propensities
             self.build_propensity_vector(
