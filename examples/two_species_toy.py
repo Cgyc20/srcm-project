@@ -23,6 +23,7 @@ def main():
     model.reaction({"U": 1, "V": 1}, {"V": 1}, rate="c")
     model.reaction({"V": 1}, {}, rate="d")
 
+    # hybrid-only configuration
     model.conversion(
         threshold={"U": [10, 20], "V": [10, 20]},
         rate=1.0,
@@ -41,13 +42,22 @@ def main():
     init_U[K // 2 - 2:K // 2 + 2] += 20
     init_V[K // 2 - 2:K // 2 + 2] += 10
 
-    results, meta = model.run(
+    init_counts = {
+        "U": init_U,
+        "V": init_V,
+    }
+
+    # ------------------------------------------------------------
+    # Hybrid run
+    # ------------------------------------------------------------
+    hybrid_results, hybrid_meta = model.run(
+        mode="hybrid",
         L=40.0,
         K=K,
         pde_multiple=4,
         total_time=80.0,
         dt=0.1,
-        init_counts={"U": init_U, "V": init_V},
+        init_counts=init_counts,
         repeats=50,
         output="mean",
         parallel=True,
@@ -55,12 +65,36 @@ def main():
     )
 
     ResultsIO.save(
-        results=results,
-        path="output/two_species_toy_prob.npz",
-        meta=meta,
+        results=hybrid_results,
+        path="output/two_species_toy_hybrid_prob.npz",
+        meta=hybrid_meta,
     )
 
-    print("Saved output/two_species_toy_prob.npz")
+    print("Saved output/two_species_toy_hybrid_prob.npz")
+
+    # ------------------------------------------------------------
+    # Pure SSA run
+    # ------------------------------------------------------------
+    ssa_results, ssa_meta = model.run(
+        mode="ssa",
+        L=40.0,
+        K=K,
+        total_time=80.0,
+        dt=0.1,
+        init_counts=init_counts,
+        repeats=50,
+        output="mean",
+        parallel=True,
+        progress=True,
+    )
+
+    ResultsIO.save(
+        results=ssa_results,
+        path="output/two_species_toy_ssa.npz",
+        meta=ssa_meta,
+    )
+
+    print("Saved output/two_species_toy_ssa.npz")
 
 
 if __name__ == "__main__":

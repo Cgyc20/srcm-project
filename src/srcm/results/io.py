@@ -22,13 +22,12 @@ def _domain_to_metadata(domain: Domain) -> Dict[str, Any]:
     }
 
 
-def _domain_from_metadata(meta: Dict[str, Any]) -> Domain:
-    dom = meta["domain"]
+def _domain_from_arrays(data: np.lib.npyio.NpzFile) -> Domain:
     return Domain(
-        length=float(dom["length"]),
-        n_ssa=int(dom["n_ssa"]),
-        pde_multiple=int(dom["pde_multiple"]),
-        boundary=str(dom["boundary"]),
+        length=float(data["domain_length"]),
+        n_ssa=int(data["n_ssa"]),
+        pde_multiple=int(data["pde_multiple"]),
+        boundary=str(data["boundary"]),
     )
 
 
@@ -53,33 +52,32 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _infer_result_kind(ssa: np.ndarray, pde: Optional[np.ndarray]) -> str:
+def _infer_result_kind(ssa: np.ndarray) -> str:
     """
-    Infer result kind from array ranks.
+    Infer result kind from SSA rank.
 
     Supported:
-      ssa.ndim == 3 -> single_or_mean_timeseries
-          expected SSA shape: (S, K, T)
-          expected PDE shape: (S, Npde, T)
+      ssa.ndim == 3 -> timeseries
+          expected shape: (S, K, T)
 
       ssa.ndim == 4 -> trajectories
-          expected SSA shape: (R, S, K, T)
-          expected PDE shape: (R, S, Npde, T)
+          expected shape: (R, S, K, T)
 
-      ssa.ndim == 3 and time scalar/len1 won't matter here; still timeseries
-
-      final-only is typically stored as:
-          SSA shape: (R, S, K)
-          PDE shape: (R, S, Npde)
+      final-only is handled separately by explicit arguments.
     """
-    if ssa.ndim == 4:
-        return "trajectories"
     if ssa.ndim == 3:
         return "timeseries"
+    if ssa.ndim == 4:
+        return "trajectories"
     raise ValueError(f"Unsupported SSA shape {ssa.shape}")
 
 
 def _ensure_pde_for_timeseries(res: SimulationResults) -> np.ndarray:
+    """
+    Return PDE if present; otherwise materialise zeros.
+
+    Works for hybrid and pure SSA results.
+    """
     pde = getattr(res, "pde", None)
     if pde is not None:
         return pde
@@ -89,16 +87,23 @@ def _ensure_pde_for_timeseries(res: SimulationResults) -> np.ndarray:
     n_species = int(ssa.shape[0])
     n_steps = int(time.shape[0])
     n_pde = int(res.domain.n_pde)
+
     return np.zeros((n_species, n_pde, n_steps), dtype=float)
 
 
 def _ensure_pde_for_trajectories(res: SimulationResults) -> np.ndarray:
+    """
+    Return PDE if present; otherwise materialise zeros.
+
+    Works for hybrid and pure SSA trajectory ensembles.
+    """
     pde = getattr(res, "pde", None)
     if pde is not None:
         return pde
 
     R, S, _, T = res.ssa.shape
     n_pde = int(res.domain.n_pde)
+
     return np.zeros((R, S, n_pde, T), dtype=float)
 
 
@@ -107,8 +112,8 @@ class ResultsIO:
     Unified save/load wrapper for SRCM results.
 
     Supports:
-      - single timeseries results
-      - mean timeseries results
+      - hybrid timeseries results
+      - SSA timeseries results
       - trajectory ensembles
       - final-only arrays
 
@@ -132,44 +137,45 @@ class ResultsIO:
         """
         Save either:
           1. a SimulationResults object
-          2. final-only arrays from run_repeats_final
+          2. final-only arrays
 
-        Examples
-        --------
-        ResultsIO.save(results=res, path="out/run1.npz")
+        For pure SSA results, pass:
+          - results.ssa filled
+          - results.pde = None
+          - valid domain/species
 
-        ResultsIO.save(
-            path="out/final_only.npz",
-            final_ssa=final_ssa,
-            final_pde=final_pde,
-            t_final=t_final,
-            domain=engine.domain,
-            species=engine.reactions.species,
-            meta={"run_type": "final_only"},
-        )
+        A zero PDE array will be materialised automatically for consistency.
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
         meta_out: Dict[str, Any] = dict(meta or {})
 
+        # ------------------------------------------------------------
+        # Standard SimulationResults save path
+        # ------------------------------------------------------------
         if results is not None:
             if domain is None:
                 domain = results.domain
             if species is None:
                 species = list(results.species)
 
-            ssa = results.ssa
-            kind = result_kind or _infer_result_kind(ssa, getattr(results, "pde", None))
+            ssa = np.asarray(results.ssa)
+            kind = result_kind or _infer_result_kind(ssa)
 
             if kind == "timeseries":
                 pde = _ensure_pde_for_timeseries(results)
-                time = results.time
+                time = np.asarray(results.time)
             elif kind == "trajectories":
                 pde = _ensure_pde_for_trajectories(results)
-                time = results.time
+                time = np.asarray(results.time)
             else:
                 raise ValueError(f"Unsupported inferred result kind '{kind}'")
+
+            # If caller didn't specify mode, infer a decent default:
+            # pde originally None -> likely SSA
+            if "mode" not in meta_out:
+                meta_out["mode"] = "ssa" if getattr(results, "pde", None) is None else "hybrid"
 
             payload: Dict[str, Any] = {
                 "format_version": np.array(1),
@@ -193,18 +199,23 @@ class ResultsIO:
             print(f"Saved results to {path}")
             return
 
-        # final-only mode
+        # ------------------------------------------------------------
+        # Final-only save path
+        # ------------------------------------------------------------
         if final_ssa is None or final_pde is None or t_final is None or domain is None or species is None:
             raise ValueError(
                 "For final-only saving you must provide final_ssa, final_pde, "
                 "t_final, domain, and species."
             )
 
+        if "mode" not in meta_out:
+            meta_out["mode"] = "hybrid"
+
         payload = {
             "format_version": np.array(1),
             "result_kind": np.array("final_only"),
-            "final_ssa": final_ssa,
-            "final_pde": final_pde,
+            "final_ssa": np.asarray(final_ssa),
+            "final_pde": np.asarray(final_pde),
             "t_final": np.array(float(t_final)),
             "species": np.array(list(species), dtype=object),
             "domain_length": float(domain.length),
@@ -233,6 +244,11 @@ class ResultsIO:
         obj is:
           - SimulationResults for timeseries / trajectories
           - dict with final_ssa/final_pde/t_final/domain/species for final_only
+
+        Notes
+        -----
+        Pure SSA results load back as SimulationResults too.
+        Their saved PDE array will usually be zeros.
         """
         data = np.load(str(path), allow_pickle=True)
 
@@ -243,20 +259,15 @@ class ResultsIO:
             except (json.JSONDecodeError, TypeError):
                 meta = {}
 
-        domain = Domain(
-            length=float(data["domain_length"]),
-            n_ssa=int(data["n_ssa"]),
-            pde_multiple=int(data["pde_multiple"]),
-            boundary=str(data["boundary"]),
-        )
+        domain = _domain_from_arrays(data)
         species = [str(s) for s in data["species"].tolist()]
         result_kind = str(data["result_kind"]) if "result_kind" in data.files else "timeseries"
 
         if result_kind in ("timeseries", "trajectories"):
             res = SimulationResults(
-                time=data["time"],
-                ssa=data["ssa"],
-                pde=data["pde"] if "pde" in data.files else None,
+                time=np.asarray(data["time"]),
+                ssa=np.asarray(data["ssa"]),
+                pde=np.asarray(data["pde"]) if "pde" in data.files else None,
                 domain=domain,
                 species=species,
             )
@@ -264,8 +275,8 @@ class ResultsIO:
 
         if result_kind == "final_only":
             out = {
-                "final_ssa": data["final_ssa"],
-                "final_pde": data["final_pde"],
+                "final_ssa": np.asarray(data["final_ssa"]),
+                "final_pde": np.asarray(data["final_pde"]),
                 "t_final": float(data["t_final"]),
                 "domain": domain,
                 "species": species,
