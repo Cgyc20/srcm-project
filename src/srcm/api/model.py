@@ -12,10 +12,8 @@ from ..hybrid_solver import (
     SimulationResults,
     SRCMEngine,
 )
-from ..ssa_solver import (
-    SSAEngine,
-    SSAReaction
-)
+from ..ssa_solver import SSAEngine, SSAReaction
+from ..pde_solver import PDEEngine
 
 
 UserRHSFn = Callable[..., Union[Sequence[np.ndarray], np.ndarray]]
@@ -29,6 +27,7 @@ class SRCMModel:
     Supports:
       - mode="hybrid"
       - mode="ssa"
+      - mode="pde"
     """
 
     species: List[str]
@@ -36,9 +35,13 @@ class SRCMModel:
 
     _diffusion_rates: Optional[Dict[str, float]] = None
     _reaction_rates: Dict[str, float] = field(default_factory=dict)
-    _rhs_user: Optional[UserRHSFn] = None
 
-    # store user reactions neutrally, not as a hybrid-specific object
+    # hybrid split PDE terms
+    _rhs_user: Optional[UserRHSFn] = None
+    # full deterministic PDE system
+    _rhs_full_user: Optional[UserRHSFn] = None
+
+    # store user reactions neutrally
     _reaction_specs: List[Dict[str, Any]] = field(default_factory=list)
 
     _conversion_threshold: Any = None
@@ -98,7 +101,7 @@ class SRCMModel:
         removal: str = "bool",
     ) -> "SRCMModel":
         """
-        Configure hybrid conversion.
+        Hybrid-only conversion configuration.
 
         threshold formats
         -----------------
@@ -110,11 +113,6 @@ class SRCMModel:
 
         Convention for double threshold:
             [CD_threshold, DC_threshold]
-
-        removal
-        -------
-        "bool" : standard / sufficient-mass removal rule
-        "prob" : probabilistic removal rule
         """
         if removal not in ("bool", "prob"):
             raise ValueError("removal must be 'bool' or 'prob'")
@@ -125,11 +123,21 @@ class SRCMModel:
         return self
 
     def pde(self, fn: UserRHSFn) -> "SRCMModel":
+        """
+        Hybrid split PDE terms only.
+        """
         self._rhs_user = fn
         return self
 
+    def pde_full(self, fn: UserRHSFn) -> "SRCMModel":
+        """
+        Full deterministic PDE system for pure PDE mode.
+        """
+        self._rhs_full_user = fn
+        return self
+
     # ------------------------------------------------------------------
-    # helpers
+    # readiness checks
     # ------------------------------------------------------------------
     def _require_diffusion(self) -> None:
         if self._diffusion_rates is None:
@@ -144,7 +152,16 @@ class SRCMModel:
 
     def _require_ssa_ready(self) -> None:
         self._require_diffusion()
+        # diffusion-only SSA is allowed, so no reaction requirement here
 
+    def _require_pde_ready(self) -> None:
+        self._require_diffusion()
+        if self._rhs_full_user is None:
+            raise ValueError("pde_full(...) must be set before run(mode='pde')")
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
     def _normalise_per_species(
         self,
         x: Any,
@@ -241,37 +258,31 @@ class SRCMModel:
             boundary=str(self.boundary),
         )
 
-    def _build_pde_terms(self) -> Callable[[np.ndarray, Dict[str, float]], np.ndarray]:
-        if self._rhs_user is None:
-            raise RuntimeError("pde(...) must be set before build")
-
-        n = len(self.species)
-        user_fn = self._rhs_user
-
-        def pde_terms(C: np.ndarray, rates_: Dict[str, float]) -> np.ndarray:
+    def _wrap_rhs(self, fn: UserRHSFn, n: int) -> Callable[[np.ndarray, Dict[str, float]], np.ndarray]:
+        def wrapped(C: np.ndarray, rates_: Dict[str, float]) -> np.ndarray:
             args = [C[i] for i in range(n)]
-            out = user_fn(*args, rates_)  # type: ignore[misc]
+            out = fn(*args, rates_)  # type: ignore[misc]
 
             if isinstance(out, np.ndarray):
                 arr = out.astype(float, copy=False)
                 if arr.shape != C.shape:
                     raise ValueError(
-                        f"pde(...) returned array with shape {arr.shape}, expected {C.shape}"
+                        f"PDE function returned shape {arr.shape}, expected {C.shape}"
                     )
                 return arr
 
             out = tuple(out)
             if len(out) != n:
-                raise ValueError(f"pde(...) returned {len(out)} outputs, expected {n}")
+                raise ValueError(f"PDE function returned {len(out)} outputs, expected {n}")
 
             arr = np.array(out, dtype=float)
             if arr.shape != C.shape:
                 raise ValueError(
-                    f"pde(...) returned array with shape {arr.shape}, expected {C.shape}"
+                    f"PDE function returned shape {arr.shape}, expected {C.shape}"
                 )
             return arr
 
-        return pde_terms
+        return wrapped
 
     def _build_hybrid_reaction_system(self) -> HybridReactionSystem:
         rs = HybridReactionSystem(species=list(self.species))
@@ -302,8 +313,8 @@ class SRCMModel:
 
         domain = self._build_domain(L=L, K=K, pde_multiple=pde_multiple)
         conversion = self._build_conversion()
-        pde_terms = self._build_pde_terms()
         reactions = self._build_hybrid_reaction_system()
+        pde_terms = self._wrap_rhs(self._rhs_user, len(self.species))  # type: ignore[arg-type]
 
         return SRCMEngine(
             reactions=reactions,
@@ -315,11 +326,24 @@ class SRCMModel:
             cd_removal_mode="probabilistic" if self._removal_mode == "prob" else "standard",
         )
 
-    def _build_ssa_reaction_system(self) ->SSAReaction:
+    def _build_ssa_reaction_system(self) -> SSAReaction:
         """
         Build the pure SSA reaction system from neutral reaction specs.
+        Also supports diffusion-only SSA.
         """
-        rs = SSAReaction(species_list=list(self.species))
+        try:
+            rs = SSAReaction(species_list=list(self.species))
+        except TypeError:
+            rs = SSAReaction()
+            # fallback for older SSAReaction classes
+            rs.species_list = list(self.species)
+            rs.species_index = {s: i for i, s in enumerate(self.species)}
+            rs.number_of_species = len(self.species)
+            rs.number_of_reactions = 0
+            rs.reaction_set = []
+            rs.stoichiometric_matrix = np.zeros((len(self.species), 0), dtype=int)
+            rs.reaction_labels = []
+            rs.stoichiometric_df = None
 
         for spec in self._reaction_specs:
             rate_name = spec["rate_name"]
@@ -357,13 +381,36 @@ class SRCMModel:
             domain=domain,
         )
 
+    def _build_pde_backend(
+        self,
+        *,
+        L: float,
+        K: int,
+        pde_multiple: int,
+    ) -> PDEEngine:
+        self._require_pde_ready()
+
+        domain = self._build_domain(L=L, K=K, pde_multiple=pde_multiple)
+        pde_terms = self._wrap_rhs(self._rhs_full_user, len(self.species))  # type: ignore[arg-type]
+
+        return PDEEngine(
+            species=list(self.species),
+            pde_reaction_terms=pde_terms,
+            diffusion_rates=self._diffusion_rates,  # type: ignore[arg-type]
+            domain=domain,
+            reaction_rates=dict(self._reaction_rates),
+        )
+
     def _coerce_init_counts(
         self,
-        init_counts: Union[np.ndarray, Dict[str, np.ndarray]],
+        init_counts: Optional[Union[np.ndarray, Dict[str, np.ndarray]]],
         *,
         K: int,
     ) -> np.ndarray:
         n = len(self.species)
+
+        if init_counts is None:
+            return np.zeros((n, K), dtype=int)
 
         if isinstance(init_counts, np.ndarray):
             arr = init_counts.astype(int, copy=False)
@@ -389,7 +436,7 @@ class SRCMModel:
                 arr[i] = vals
             return arr
 
-        raise TypeError("init_counts must be a numpy array or dict[str, array]")
+        raise TypeError("init_counts must be None, a numpy array, or dict[str, array]")
 
     def _coerce_init_pde(
         self,
@@ -440,7 +487,7 @@ class SRCMModel:
         pde_multiple: int = 4,
         total_time: float,
         dt: float,
-        init_counts: Union[np.ndarray, Dict[str, np.ndarray]],
+        init_counts: Optional[Union[np.ndarray, Dict[str, np.ndarray]]] = None,
         init_pde: Optional[Union[np.ndarray, Dict[str, np.ndarray]]] = None,
         repeats: int = 1,
         output: str = "single",
@@ -453,25 +500,24 @@ class SRCMModel:
         """
         Run the model.
 
-        Parameters
-        ----------
-        mode : {"hybrid", "ssa"}
+        mode : {"hybrid", "ssa", "pde"}
         output : {"single", "mean", "trajectories", "final"}
 
         Notes
         -----
-        - For mode="hybrid", conversion(...) and pde(...) must be configured.
-        - For mode="ssa", conversion(...) and pde(...) are ignored.
+        - hybrid uses pde(...) + conversion(...)
+        - ssa ignores pde(...) and conversion(...)
+        - pde uses pde_full(...) and ignores conversion(...)
         """
-        if mode not in ("hybrid", "ssa"):
-            raise ValueError("mode must be one of: 'hybrid', 'ssa'")
+        if mode not in ("hybrid", "ssa", "pde"):
+            raise ValueError("mode must be one of: 'hybrid', 'ssa', 'pde'")
         if output not in ("single", "mean", "trajectories", "final"):
             raise ValueError("output must be one of: 'single', 'mean', 'trajectories', 'final'")
 
+        # -------------------- SSA --------------------
         if mode == "ssa":
             engine = self._build_ssa_backend(L=L, K=K)
             domain = engine.domain
-
             ssa0 = self._coerce_init_counts(init_counts, K=domain.K)
 
             if output == "single":
@@ -533,16 +579,29 @@ class SRCMModel:
                 progress=bool(progress),
                 save_path=None,
             )
-            return (
-                final_ssa,
-                final_pde,
-                t_final,
-            ), self.metadata(mode=mode, domain=domain, output=output, repeats=int(repeats))
+            return (final_ssa, final_pde, t_final), self.metadata(
+                mode=mode, domain=domain, output=output, repeats=int(repeats)
+            )
 
-        # hybrid mode
+        # -------------------- PDE --------------------
+        if mode == "pde":
+            engine = self._build_pde_backend(L=L, K=K, pde_multiple=pde_multiple)
+            domain = engine.domain
+            pde0 = self._coerce_init_pde(init_pde, n_pde=domain.n_pde)
+
+            if output != "single":
+                raise ValueError("mode='pde' currently only supports output='single'")
+
+            res = engine.run(
+                initial_pde=pde0,
+                time=float(total_time),
+                dt=float(dt),
+            )
+            return res, self.metadata(mode=mode, domain=domain, output=output, repeats=1)
+
+        # -------------------- HYBRID --------------------
         engine = self._build_hybrid_engine(L=L, K=K, pde_multiple=pde_multiple)
         domain = engine.domain
-
         ssa0 = self._coerce_init_counts(init_counts, K=domain.K)
         pde0 = self._coerce_init_pde(init_pde, n_pde=domain.n_pde)
 
@@ -605,11 +664,9 @@ class SRCMModel:
             progress=bool(progress),
             save_path=None,
         )
-        return (
-            final_ssa,
-            final_pde,
-            t_final,
-        ), self.metadata(mode=mode, domain=domain, output=output, repeats=int(repeats))
+        return (final_ssa, final_pde, t_final), self.metadata(
+            mode=mode, domain=domain, output=output, repeats=int(repeats)
+        )
 
     # ------------------------------------------------------------------
     # metadata / inspection
@@ -643,10 +700,11 @@ class SRCMModel:
                 "boundary": str(domain.boundary),
             }
 
-        if self._conversion_threshold is not None:
-            out["conversion_threshold"] = self._conversion_threshold
-        if self._conversion_rate is not None:
-            out["conversion_rate"] = self._conversion_rate
+        if mode == "hybrid":
+            if self._conversion_threshold is not None:
+                out["conversion_threshold"] = self._conversion_threshold
+            if self._conversion_rate is not None:
+                out["conversion_rate"] = self._conversion_rate
 
         return out
 
