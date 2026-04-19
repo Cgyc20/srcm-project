@@ -235,8 +235,8 @@ class PDEEngine:
             raise ValueError("total_time must be a positive number")
 
         total_time = float(total_time)
-        self.timevector = np.arange(0.0, total_time + 1e-12, self.dt)
-
+        #self.timevector = np.arange(0.0, total_time + 1e-12, self.dt)
+        self.timevector = np.arange(0.0, total_time, self.dt) #Changed (possible bug,)
         if self.model_type == "one_species":
             u_record = np.zeros((len(self.timevector), self.n), dtype=float)
             u = self.u0.copy()
