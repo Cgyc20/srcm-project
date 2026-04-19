@@ -70,7 +70,7 @@ This package implements SRCM using:
 ## Installation
 
 ```bash
-pip install "git+https://github.com/Cgyc20/Integrated-srcm-ssa.git@v1.3.0"
+pip install "git+https://github.com/Cgyc20/srcm-project.git"
 ```
 
 ---
