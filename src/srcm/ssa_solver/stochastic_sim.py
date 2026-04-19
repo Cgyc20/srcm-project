@@ -64,9 +64,7 @@ class SSAEngine:
             raise ValueError("time must be > 0")
         if dt <= 0:
             raise ValueError("dt must be > 0")
-
-        n_steps = int(np.floor(time / dt)) + 1
-        return np.arange(n_steps, dtype=float) * dt
+        return np.arange(0.0, time, dt, dtype=float)
 
     def _initial_tensor(self, time: float, dt: float, initial_ssa: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -108,16 +106,18 @@ class SSAEngine:
             n = frame[species_index, :]
 
             if self.boundary_conditions == "periodic":
-                propensity_vector[start_idx:end_idx] = 2.0 * self.jump_rate_list[species_index] * n
+                propensity_vector[start_idx:end_idx] = (
+                    2.0 * self.jump_rate_list[species_index] * n
+                )
 
             else:  # zero-flux
-                rates = 2.0 * self.jump_rate_list[species_index] * n
-
-                if self.K >= 1:
+                if self.K == 1:
+                    propensity_vector[start_idx:end_idx] = 0.0
+                else:
+                    rates = 2.0 * self.jump_rate_list[species_index] * n
                     rates[0] = self.jump_rate_list[species_index] * n[0]
                     rates[-1] = self.jump_rate_list[species_index] * n[-1]
-
-                propensity_vector[start_idx:end_idx] = rates
+                    propensity_vector[start_idx:end_idx] = rates
                 
         # reaction blocks
         for i, reaction in enumerate(self.reaction_set):
@@ -177,8 +177,15 @@ class SSAEngine:
         while t < time:
             propensity_vector = self._propensity_calculation(current_frame, propensity_vector)
 
+            # alpha0 = float(np.sum(propensity_vector))
+            # if alpha0 <= 0.0:
+            #     break
+
             alpha0 = float(np.sum(propensity_vector))
             if alpha0 <= 0.0:
+                ind_now = int(t / dt)
+                for time_index in range(ind_now + 1, len(tvec)):
+                    tensor[time_index, :, :] = current_frame
                 break
 
             r1, r2, r3 = rng.random(3)
