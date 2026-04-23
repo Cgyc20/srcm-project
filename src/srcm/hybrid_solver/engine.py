@@ -233,6 +233,200 @@ class SRCMEngine:
         state.add_discrete(species_idx, comp, +1)
         state.add_continuous_particle_mass(self.domain, species_idx, comp, -1)
 
+    # def _apply_cd_probabilistic(
+    #     self,
+    #     state: HybridState,
+    #     species_idx: int,
+    #     comp: int,
+    #     rng: np.random.Generator,
+    # ) -> None:
+    #     """
+    #     Probabilistic CD removal:
+    #     - if compartment has mass Y_k < 1, clear all PDE mass and create one
+    #       SSA particle with probability Y_k
+    #     - if Y_k >= 1, remove exactly one particle mass from the PDE slice
+    #       using either uniform removal or the fallback redistribution scheme
+    #     """
+    #     P = self.domain.pde_multiple
+    #     start_index = comp * P
+    #     final_index = start_index + P
+    #     slice_ = state.pde[species_idx, start_index:final_index]
+
+    #     dx = self.domain.dx
+    #     h = self.domain.h
+    #     drop = 1.0 / h
+
+    #     Y_k = float(slice_.sum() * dx)
+
+    #     # Safety for tiny negative roundoff
+    #     if Y_k <= 0.0:
+    #         slice_[:] = np.maximum(slice_, 0.0)
+    #         return
+
+    #     # Case 1: less than one particle worth of mass
+    #     if Y_k < 1.0:
+    #         p = min(max(Y_k, 0.0), 1.0)
+    #         slice_[:] = 0.0
+    #         if float(rng.random()) < p:
+    #             state.add_discrete(species_idx, comp, +1)
+    #         return
+
+    #     # Case 2: at least one particle worth of mass
+    #     # try simple uniform removal first
+    #     if np.all(slice_ >= drop):
+    #         state.add_continuous_particle_mass(self.domain, species_idx, comp, -1)
+    #         state.add_discrete(species_idx, comp, +1)
+    #         return
+
+    #     # Fallback: zero out smaller cells and remove the rest from larger cells
+    #     remaining = 1.0
+    #     active = np.ones(P, dtype=bool)
+
+    #     while remaining > 1e-12:
+    #         n_active = int(np.sum(active))
+    #         if n_active == 0:
+    #             raise RuntimeError("Not enough PDE mass to remove one particle")
+
+    #         share = remaining / n_active
+    #         changed = False
+
+    #         for j in range(P):
+    #             if not active[j]:
+    #                 continue
+
+    #             removable = float(slice_[j] * dx)
+
+    #             if removable <= share + 1e-12:
+    #                 remaining -= removable
+    #                 slice_[j] = 0.0
+    #                 active[j] = False
+    #                 changed = True
+
+    #         if changed:
+    #             continue
+
+    #         # every active cell can support the equal share
+    #         slice_[active] -= share / dx
+    #         remaining = 0.0
+
+    #     state.add_discrete(species_idx, comp, +1)
+
+
+
+
+    # def _apply_cd_probabilistic(
+    #     self,
+    #     state: HybridState,
+    #     species_idx: int,
+    #     comp: int,
+    #     rng: np.random.Generator,
+    # ) -> None:
+    #     P = self.domain.pde_multiple
+    #     start = comp * P
+    #     end = start + P
+    #     slice_ = state.pde[species_idx, start:end]
+    #     dx = self.domain.dx
+    #     h = self.domain.h
+
+    #     Y_k = slice_.sum() * dx   # total mass in compartment
+
+    #     # Safety for tiny negative roundoff
+    #     if Y_k <= 0.0:
+    #         slice_[:] = 0.0
+    #         return
+
+    #     # Case 1: less than one particle -> probabilistic conversion or discard
+    #     if Y_k < 1.0:
+    #         p = min(max(Y_k, 0.0), 1.0)
+    #         slice_[:] = 0.0
+    #         if rng.random() < p:
+    #             state.add_discrete(species_idx, comp, +1)
+    #         return
+
+    #     # Case 2: at least one particle worth of mass
+    #     # Try uniform slab removal (fast path for well‑mixed compartments)
+    #     drop = 1.0 / h
+    #     if np.all(slice_ >= drop - 1e-12):
+    #         state.add_continuous_particle_mass(self.domain, species_idx, comp, -1)
+    #         state.add_discrete(species_idx, comp, +1)
+    #         return
+
+    #     # Fallback: proportional scaling (preserves shape)
+    #     alpha = (Y_k - 1.0) / Y_k   # factor to remove exactly one particle
+    #     slice_[:] *= alpha
+    #     state.add_discrete(species_idx, comp, +1)
+
+
+    #THis only removes if less than 1./h
+    # def _apply_cd_probabilistic(
+    #     self,
+    #     state: HybridState,
+    #     species_idx: int,
+    #     comp: int,
+    #     rng: np.random.Generator,
+    # ) -> None:
+    #     P = self.domain.pde_multiple
+    #     start = comp * P
+    #     end = start + P
+    #     slice_ = state.pde[species_idx, start:end]
+
+    #     dx = self.domain.dx
+    #     h = self.domain.h
+    #     drop = 1.0 / h
+
+    #     Y_k = float(slice_.sum() * dx)
+
+    #     # tiny roundoff protection
+    #     if Y_k <= 0.0:
+    #         slice_[:] = np.maximum(slice_, 0.0)
+    #         return
+
+    #     # Only new feature: probabilistic handling of sub-particle mass
+    #     if Y_k < 1.0:
+    #         p = min(max(Y_k, 0.0), 1.0)
+    #         slice_[:] = 0.0
+    #         if rng.random() < p:
+    #             state.add_discrete(species_idx, comp, +1)
+    #         return
+
+    #     # For Y_k >= 1, keep the old behaviour exactly
+    #     if np.all(slice_ >= drop - 1e-12):
+    #         state.add_continuous_particle_mass(self.domain, species_idx, comp, -1)
+    #         state.add_discrete(species_idx, comp, +1)
+    #         return
+
+    #     # old fallback
+    #     remaining = 1.0
+    #     active = np.ones(P, dtype=bool)
+
+    #     while remaining > 1e-12:
+    #         n_active = int(np.sum(active))
+    #         if n_active == 0:
+    #             raise RuntimeError("Not enough PDE mass to remove one particle")
+
+    #         share = remaining / n_active
+    #         changed = False
+
+    #         for j in range(P):
+    #             if not active[j]:
+    #                 continue
+
+    #             removable = float(slice_[j] * dx)
+
+    #             if removable <= share + 1e-12:
+    #                 remaining -= removable
+    #                 slice_[j] = 0.0
+    #                 active[j] = False
+    #                 changed = True
+
+    #         if changed:
+    #             continue
+
+    #         slice_[active] -= share / dx
+    #         remaining = 0.0
+
+    #     state.add_discrete(species_idx, comp, +1)
+
     def _apply_cd_probabilistic(
         self,
         state: HybridState,
@@ -240,76 +434,27 @@ class SRCMEngine:
         comp: int,
         rng: np.random.Generator,
     ) -> None:
-        """
-        Probabilistic CD removal:
-        - if compartment has mass Y_k < 1, clear all PDE mass and create one
-          SSA particle with probability Y_k
-        - if Y_k >= 1, remove exactly one particle mass from the PDE slice
-          using either uniform removal or the fallback redistribution scheme
-        """
         P = self.domain.pde_multiple
         start_index = comp * P
-        final_index = start_index + P
-        slice_ = state.pde[species_idx, start_index:final_index]
-
+        slice_ = state.pde[species_idx, start_index:start_index + P]
         dx = self.domain.dx
         h = self.domain.h
-        drop = 1.0 / h
 
         Y_k = float(slice_.sum() * dx)
 
-        # Safety for tiny negative roundoff
-        if Y_k <= 0.0:
-            slice_[:] = np.maximum(slice_, 0.0)
-            return
-
-        # Case 1: less than one particle worth of mass
-        if Y_k < 1.0:
-            p = min(max(Y_k, 0.0), 1.0)
-            slice_[:] = 0.0
-            if float(rng.random()) < p:
+        if Y_k >= 1.0:
+            # Only allow standard removal if every cell has >= 1/h
+            # If any cell is below 1/h, block the event entirely
+            if np.all(slice_ >= 1.0 / h):
                 state.add_discrete(species_idx, comp, +1)
+                state.add_continuous_particle_mass(self.domain, species_idx, comp, -1)
             return
 
-        # Case 2: at least one particle worth of mass
-        # try simple uniform removal first
-        if np.all(slice_ >= drop):
-            state.add_continuous_particle_mass(self.domain, species_idx, comp, -1)
+        # Sub-particle regime: absorb stochastically, always clear the slice
+        if Y_k > 0.0 and float(rng.random()) < Y_k:
             state.add_discrete(species_idx, comp, +1)
-            return
+        slice_[:] = 0.0
 
-        # Fallback: zero out smaller cells and remove the rest from larger cells
-        remaining = 1.0
-        active = np.ones(P, dtype=bool)
-
-        while remaining > 1e-12:
-            n_active = int(np.sum(active))
-            if n_active == 0:
-                raise RuntimeError("Not enough PDE mass to remove one particle")
-
-            share = remaining / n_active
-            changed = False
-
-            for j in range(P):
-                if not active[j]:
-                    continue
-
-                removable = float(slice_[j] * dx)
-
-                if removable <= share + 1e-12:
-                    remaining -= removable
-                    slice_[j] = 0.0
-                    active[j] = False
-                    changed = True
-
-            if changed:
-                continue
-
-            # every active cell can support the equal share
-            slice_[active] -= share / dx
-            remaining = 0.0
-
-        state.add_discrete(species_idx, comp, +1)
 
     def apply_event(
         self,
