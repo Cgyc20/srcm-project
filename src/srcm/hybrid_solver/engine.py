@@ -78,8 +78,11 @@ class SRCMEngine:
             D = float(self.diffusion_rates[sp])
             out[s_idx, :] = (D / dx2) * (self._L @ C[s_idx, :])
 
-        # Reaction part (macroscopic)
-        out += self.pde_reaction_terms(C, self.reaction_rates)
+        # Reaction part: suppressed at PDE points where any species is below 1/h
+        # (sub-particle regime — continuum description invalid there)
+        rxn = self.pde_reaction_terms(C, self.reaction_rates)
+        active = np.all(C >= 1.0 / self.domain.h, axis=0)  # shape (Npde,)
+        out += rxn * active[np.newaxis, :]
         return out
 
     # ------------------------------------------------------------------
@@ -451,7 +454,7 @@ class SRCMEngine:
             return
 
         # Sub-particle regime: absorb stochastically, always clear the slice
-        if Y_k > 0.0 and float(rng.random()) < Y_k:
+        if Y_k > 0.0 and float(rng.random()) < Y_k: 
             state.add_discrete(species_idx, comp, +1)
         slice_[:] = 0.0
 
