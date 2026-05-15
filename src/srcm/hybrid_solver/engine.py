@@ -440,20 +440,15 @@ class SRCMEngine:
         dx = self.domain.dx
         h = self.domain.h
 
-        Y_k = float(slice_.sum() * dx)
+        # Remove min(1/h, C[j]) from each PDE cell — never goes negative
+        removed = np.minimum(1.0 / h, np.maximum(slice_, 0.0))
+        slice_ -= removed
 
-        if Y_k >= 1.0:
-            # Only allow standard removal if every cell has >= 1/h
-            # If any cell is below 1/h, block the event entirely
-            if np.all(slice_ >= 1.0 / h):
-                state.add_discrete(species_idx, comp, +1)
-                state.add_continuous_particle_mass(self.domain, species_idx, comp, -1)
-            return
+        # Total mass removed; always in [0, 1] because P*(1/h)*dx = P*dx/h = 1
+        M = float(removed.sum() * dx)
 
-        # Sub-particle regime: absorb stochastically, always clear the slice
-        if Y_k > 0.0 and float(rng.random()) < Y_k:
+        if M > 0.0 and rng.random() < M:
             state.add_discrete(species_idx, comp, +1)
-        slice_[:] = 0.0
 
 
     def apply_event(
