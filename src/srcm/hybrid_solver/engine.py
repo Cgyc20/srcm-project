@@ -32,6 +32,7 @@ class SRCMEngine:
     conversion: ConversionParams
     reaction_rates: Dict[str, float]          # dict passed into propensity lambdas + pde_terms
     cd_removal_mode: CDRemovalMode = "standard"
+    enable_front_cleanup: bool = True
 
     def __post_init__(self):
         # basic validations
@@ -41,6 +42,8 @@ class SRCMEngine:
             raise ValueError("zero-flux with K<=1 is degenerate (needs at least 2 compartments)")
         if self.cd_removal_mode not in ("standard", "probabilistic"):
             raise ValueError("cd_removal_mode must be 'standard' or 'probabilistic'")
+        if not isinstance(self.enable_front_cleanup, bool):
+            raise ValueError("enable_front_cleanup must be a bool")
 
         # Precompute PDE Laplacian once
         self._L = laplacian_1d(self.domain)
@@ -451,6 +454,50 @@ class SRCMEngine:
             state.add_discrete(species_idx, comp, +1)
 
 
+    def _post_pde_cleanup(self, state: HybridState, rng: np.random.Generator) -> None:
+        """
+        After each PDE step: for any compartment in the CD regime that still holds
+        sub-particle PDE mass (Y_k < 1), zero out that mass and create a discrete
+        particle with probability = mass removed.
+
+        This enforces the Brunet-Derrida N-cutoff once per dt, completely
+        independently of γ.  It prevents tiny leaked PDE mass at the wave tip
+        from driving deterministic (PDE-speed) propagation between Gillespie events.
+
+        Conditions for cleanup in compartment k, species s:
+          1. combined mass < CD_threshold  (compartment is in the stochastic regime)
+          2. PDE mass Y_k in (0, 1)         (sub-particle — deterministic PDE has no
+                                             right to propagate this further)
+        """
+        P = self.domain.pde_multiple
+        dx = self.domain.dx
+        n_species = self.reactions.n_species
+
+        combined, pde_mass = self.MassProj.get_combined_total_mass(state.ssa, state.pde)
+
+        for s_idx in range(n_species):
+            cd_thr = self.conversion.CD_threshold_for(s_idx)
+            for k in range(self.domain.K):
+                # Only act in genuinely stochastic compartments
+                if combined[s_idx, k] >= cd_thr:
+                    continue
+
+                Y_k = pde_mass[s_idx, k]
+                if Y_k <= 0.0 or Y_k >= 1.0:
+                    continue
+
+                start = k * P
+                slice_ = state.pde[s_idx, start:start + P]
+
+                # Remove all positive PDE mass (clip negatives first for safety)
+                positive = np.maximum(slice_, 0.0)
+                removed_mass = float(positive.sum() * dx)
+                slice_[:] = 0.0
+
+                # Probabilistic particle creation conserves expected mass
+                if removed_mass > 0.0 and rng.random() < removed_mass:
+                    state.add_discrete(s_idx, k, +1)
+
     def apply_event(
         self,
         idx: int,
@@ -694,6 +741,10 @@ class SRCMEngine:
 
             # deterministic PDE step to t1
             state.pde = rk4_step(state.pde, t=t0, dt=dt, rhs=self.pde_rhs)
+
+            # enforce N-cutoff: zero sub-particle PDE mass at the stochastic front
+            if self.enable_front_cleanup:
+                self._post_pde_cleanup(state, rng)
 
             # record at t1
             ssa_out[:, :, n + 1] = state.ssa
