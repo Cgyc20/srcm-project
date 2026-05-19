@@ -4,6 +4,24 @@ All notable changes to the SRCM package are documented here.
 
 ---
 
+## [v0.0.4] — 2026-05-19
+
+### Changed
+
+**Inner-loop performance optimisations (`engine.py`)**
+
+Four targeted changes to reduce overhead in the Gillespie hot path:
+
+1. **Removed `state.assert_consistent` from the inner loop.** Previously called twice per Gillespie event (inside `build_propensity_vector` and `apply_event`). State shapes cannot change mid-simulation, so this was pure redundant validation. The single call in `run` at initialisation is sufficient.
+
+2. **Removed duplicate negative-propensity scan.** `_simulate_interval` was running `np.any(propensity < 0)` (an O(N) scan) every step before calling `gillespie_draw`, which performs the identical check internally and raises on failure. The outer scan was eliminated; `gillespie_draw` remains the safety net.
+
+3. **Vectorised `pde_rhs` and precomputed `D/dx²`.** The per-species Python loop calling `L @ C[s]` separately for each species is replaced by a single batched BLAS call `(L @ C.T).T`, scaled by a precomputed `(n_species, 1)` array `_D_over_dx2`. Called 4× per timestep (RK4), the saving compounds.
+
+4. **Vectorised CD/DC propensity blocks and precomputed gamma rates.** The two Python `for`-loops over species in `build_propensity_vector` (with per-iteration `rate_for` calls that each invoke `np.isscalar`) are replaced by two numpy array expressions using a precomputed `(n_species, 1)` column vector `_gamma_arr`.
+
+---
+
 ## [v0.0.3] — 2026-05-18
 
 ### Added

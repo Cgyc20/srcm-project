@@ -60,7 +60,21 @@ class SRCMEngine:
 
         # Useful mappings
         self._sp_to_idx = {sp: i for i, sp in enumerate(self.reactions.species)}
-        
+
+        # Precompute D/dx² per species as column vector for broadcasting in pde_rhs
+        dx2 = self.domain.dx ** 2
+        self._D_over_dx2 = np.array(
+            [float(self.diffusion_rates[sp]) / dx2 for sp in self.reactions.species],
+            dtype=float,
+        ).reshape(-1, 1)
+
+        # Precompute gamma (conversion rate) per species as column vector for broadcasting
+        n_sp = self.reactions.n_species
+        self._gamma_arr = np.array(
+            [self.conversion.rate_for(s) for s in range(n_sp)],
+            dtype=float,
+        ).reshape(-1, 1)
+
         #Mass calculatiion class
         self.MassProj = MassProjector(pde_multiple=self.domain.pde_multiple,dx=self.domain.dx, h = self.domain.h)
         
@@ -72,18 +86,8 @@ class SRCMEngine:
         C shape: (n_species, Npde)
         returns dC/dt shape: (n_species, Npde)
         """
-        n_species, Npde = C.shape
-        out = np.zeros_like(C, dtype=float)
-
-        # Diffusion part: (D/dx^2) * L @ C_s
-        dx2 = self.domain.dx ** 2
-        for sp, s_idx in self._sp_to_idx.items():
-            D = float(self.diffusion_rates[sp])
-            out[s_idx, :] = (D / dx2) * (self._L @ C[s_idx, :])
-
-        # Reaction part (macroscopic)
-        out += self.pde_reaction_terms(C, self.reaction_rates)
-        return out
+        # One batched matmul for all species: (L @ C.T).T == L applied row-wise
+        return self._D_over_dx2 * (self._L @ C.T).T + self.pde_reaction_terms(C, self.reaction_rates)
 
     # ------------------------------------------------------------------
     # Propensity building
@@ -117,8 +121,6 @@ class SRCMEngine:
             sufficient_mask: Mask (n_species, K), 1 if ALL PDE cells in that
                              compartment have concentration >= (1/h), else 0
         """
-        state.assert_consistent(self.domain)
-
         n_species = self.reactions.n_species
         K = self.domain.K
         n_hybrid = len(self.reactions.hybrid_reactions)
@@ -142,34 +144,18 @@ class SRCMEngine:
         # ------------------------------------------------------------------
         # n_species..(2*n_species-1): CD (PDE -> SSA)
         # ------------------------------------------------------------------
-        for s_idx in range(n_species):
-            block = n_species + s_idx
-            start = block * K
-            end = start + K
-
-            available_mass = np.maximum(pde_mass[s_idx, :], 0.0)
-            gamma = self.conversion.rate_for(s_idx)
-
-            if self.cd_removal_mode == "probabilistic":
-                # Relaxed gating: if in CD regime, allow even when sufficient_mask fails
-                cd_allowed = (CD_mask[s_idx, :] == 1)
-            else:
-                # Standard gating: require enough concentration everywhere
-                cd_allowed = (CD_mask[s_idx, :] == 1) & (sufficient_mask[s_idx, :] == 1)
-
-            a[start:end] = gamma * available_mass * cd_allowed
+        available_mass = np.maximum(pde_mass, 0.0)  # (n_species, K)
+        if self.cd_removal_mode == "probabilistic":
+            cd_allowed = CD_mask == 1
+        else:
+            cd_allowed = (CD_mask == 1) & (sufficient_mask == 1)
+        a[n_species * K : 2 * n_species * K] = (self._gamma_arr * available_mass * cd_allowed).ravel()
 
         # ------------------------------------------------------------------
         # (2*n_species)..(3*n_species-1): DC (SSA -> PDE)
         # ------------------------------------------------------------------
-        for s_idx in range(n_species):
-            block = 2 * n_species + s_idx
-            start = block * K
-            end = start + K
-
-            dc_allowed = (DC_mask[s_idx, :] == 1)
-            gamma = self.conversion.rate_for(s_idx)
-            a[start:end] = gamma * state.ssa[s_idx, :] * dc_allowed
+        dc_allowed = DC_mask == 1
+        a[2 * n_species * K : 3 * n_species * K] = (self._gamma_arr * state.ssa * dc_allowed).ravel()
 
         # ------------------------------------------------------------------
         # Hybrid reactions
@@ -522,8 +508,6 @@ class SRCMEngine:
             'D_<sp>' updates SSA
             'C_<sp>' updates PDE slice by ±1 particle mass
         """
-        state.assert_consistent(self.domain)
-
         n_species = self.reactions.n_species
         K = self.domain.K
         n_hybrid = len(self.reactions.hybrid_reactions)
@@ -613,61 +597,6 @@ class SRCMEngine:
                 sufficient,
                 out=propensity,
             )
-
-            # DEBUG: decode first negative propensity
-            if np.any(propensity < 0):
-                j = int(np.where(propensity < 0)[0][0])
-                block = j // K
-                comp = j % K
-
-                n_blocks = 3 * n_species + n_hybrid
-
-                print("\n" + "=" * 80)
-                print("NEGATIVE PROPENSITY")
-                print(f"t0={t0}, t1={t1}")
-                print(f"flat idx={j}, value={float(propensity[j])}")
-                print(f"block={block}/{n_blocks-1}, compartment={comp}/{K-1}")
-
-                if block < n_species:
-                    print("Section: diffusion")
-                    print("species:", self.reactions.species[block])
-
-                elif block < 2 * n_species:
-                    print("Section: CD (PDE -> SSA)")
-                    print("species:", self.reactions.species[block - n_species])
-                    print("pde_mass local:", pde_mass[:, comp])
-                    print("sufficient local:", sufficient[:, comp])
-                    print("CD_mask local:", CD_mask[:, comp])
-
-                elif block < 3 * n_species:
-                    print("Section: DC (SSA -> PDE)")
-                    print("species:", self.reactions.species[block - 2 * n_species])
-                    print("ssa local:", state.ssa[:, comp])
-                    print("DC_mask local:", DC_mask[:, comp])
-
-                else:
-                    rxn_idx = block - 3 * n_species
-                    hr = self.reactions.hybrid_reactions[rxn_idx]
-                    print("Section: hybrid reaction")
-                    print("rxn_idx:", rxn_idx)
-                    print("label:", hr.label)
-                    print("state_change:", hr.state_change)
-                    if getattr(hr, "description", None):
-                        print("desc:", hr.description)
-
-                    species = self.reactions.species
-                    D_local = {sp: int(state.ssa[self._sp_to_idx[sp], comp]) for sp in species}
-                    C_local = {sp: float(pde_mass[self._sp_to_idx[sp], comp]) for sp in species}
-                    print("D_local:", D_local)
-                    print("C_local:", C_local)
-
-                print("SSA local:", state.ssa[:, comp])
-                s = comp * self.domain.pde_multiple
-                e = s + self.domain.pde_multiple
-                print("PDE slice mins:", np.min(state.pde[:, s:e], axis=1))
-                print("=" * 80 + "\n")
-
-                raise ValueError("Negative propensity detected (decoded above)")
 
             # Gillespie draw
             tau, idx = gillespie_draw(propensity, rng, cumulative=cumulative)
