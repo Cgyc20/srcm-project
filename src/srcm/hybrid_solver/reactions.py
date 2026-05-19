@@ -1,13 +1,20 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple, Any
+import numpy as np
 
-# Type alias for propensity functions: (D, C, rates, h) -> float
+# Type alias for scalar propensity functions: (D, C, rates, h) -> float
 # D: {"U": discrete_count, ...}
 # C: {"U": pde_mass_per_compartment, ...}
 # rates: dict of rate constants
 # h: SSA compartment size
 PropensityFn = Callable[[Dict[str, float], Dict[str, float], Dict[str, float], float], float]
+
+# Type alias for vectorised propensity functions: (ssa, pde_mass, rates, h) -> np.ndarray
+# ssa:      shape (n_species, K)  int
+# pde_mass: shape (n_species, K)  float  — integrated PDE mass per SSA compartment
+# returns:  shape (K,)            float  — propensity for each compartment
+VecPropensityFn = Callable[[np.ndarray, np.ndarray, Dict[str, float], float], np.ndarray]
 
 @dataclass(frozen=True)
 class HybridReaction:
@@ -29,6 +36,7 @@ class HybridReaction:
     propensity: PropensityFn
     state_change: Dict[str, int]
     description: Optional[str] = None
+    vectorized_propensity: Optional[VecPropensityFn] = None  # fast path: operates on (n_sp, K) arrays
 
     # Derived metadata (auto-filled)
     consumes_continuous: bool = field(init=False)
@@ -167,21 +175,25 @@ class HybridReactionSystem:
         # Build propensity: zero-order is r * h
         def propensity(D, C, r, h):
             return r[rate_name] * h
-        
+
+        def vec_propensity(ssa, pde, r, h, _rn=rate_name):
+            return np.full(ssa.shape[1], r[_rn] * h)
+
         # Build label and description
         reactant_str = "∅"
         product_str = " + ".join([f"{count}D_{sp}" if count > 1 else f"D_{sp}" 
                                 for sp, count in products.items()])
         label = f"{rate_name}_zero"
         description = f"{reactant_str} → {product_str}"
-        
+
         self.add_hybrid_reaction(
             reactants=hybrid_reactants,
             products=hybrid_products,
             propensity=propensity,
             state_change=state_change,
             label=label,
-            description=description
+            description=description,
+            vectorized_propensity=vec_propensity,
         )
 
 
@@ -208,22 +220,28 @@ class HybridReactionSystem:
         hybrid_products = {f"D_{sp}": count for sp, count in products.items()}
         
         # Build propensity: first-order is r * D_A
+        sp_idx = self.species_index[species]
+
         def propensity(D, C, r, h):
             return r[rate_name] * D[species]
-        
+
+        def vec_propensity(ssa, pde, r, h, _sp_idx=sp_idx, _rn=rate_name):
+            return r[_rn] * ssa[_sp_idx].astype(float)
+
         # Build label and description
-        product_str = " + ".join([f"{count}D_{sp}" if count > 1 else f"D_{sp}" 
+        product_str = " + ".join([f"{count}D_{sp}" if count > 1 else f"D_{sp}"
                                 for sp, count in products.items()]) if products else "∅"
         label = f"{rate_name}_D"
         description = f"D_{species} → {product_str}"
-        
+
         self.add_hybrid_reaction(
             reactants=hybrid_reactants,
             products=hybrid_products,
             propensity=propensity,
             state_change=state_change,
             label=label,
-            description=description
+            description=description,
+            vectorized_propensity=vec_propensity,
         )
 
 
@@ -273,9 +291,15 @@ class HybridReactionSystem:
         hybrid_reactants_DD = {f"D_{species}": 2}
         hybrid_products_DD = {f"D_{sp}": count for sp, count in products.items()}
 
+        sp_idx = self.species_index[species]
+
         def propensity_DD(D, C, r, h):
             D_val = D[species]
             return r[rate_name] * D_val * (D_val - 1) / h
+
+        def vec_propensity_DD(ssa, pde, r, h, _sp_idx=sp_idx, _rn=rate_name):
+            D = ssa[_sp_idx].astype(float)
+            return r[_rn] * D * (D - 1.0) / h
 
         product_str = " + ".join(
             [f"{count}D_{sp}" if count > 1 else f"D_{sp}" for sp, count in products.items()]
@@ -287,7 +311,8 @@ class HybridReactionSystem:
             propensity=propensity_DD,
             state_change=state_change_DD,
             label=f"{rate_name}_DD",
-            description=f"D_{species} + D_{species} → {product_str}"
+            description=f"D_{species} + D_{species} → {product_str}",
+            vectorized_propensity=vec_propensity_DD,
         )
 
         # --- Reaction 2: D + C, preserve C, adjust only D by net stoichiometric delta ---
@@ -324,6 +349,9 @@ class HybridReactionSystem:
         def propensity_DC(D, C, r, h):
             return 2.0 * r[rate_name] * D[species] * C[species] / h
 
+        def vec_propensity_DC(ssa, pde, r, h, _sp_idx=sp_idx, _rn=rate_name):
+            return 2.0 * r[_rn] * ssa[_sp_idx].astype(float) * pde[_sp_idx] / h
+
         self.add_hybrid_reaction(
             reactants=hybrid_reactants_DC,
             products=hybrid_products_DC,
@@ -333,8 +361,8 @@ class HybridReactionSystem:
             description = (
                     f"D_{species} + C_{species} → "
                     f"{hybrid_products_DC['D_' + species]}D_{species} + C_{species} (factor 2, preserve C)"
-                )
-
+                ),
+            vectorized_propensity=vec_propensity_DC,
         )
 
 
@@ -346,9 +374,12 @@ class HybridReactionSystem:
         2. D_A + C_B: r * D_A * C_B / h
         3. C_A + D_B: r * C_A * D_B / h
         """
-        product_str = " + ".join([f"{count}D_{sp}" if count > 1 else f"D_{sp}" 
+        product_str = " + ".join([f"{count}D_{sp}" if count > 1 else f"D_{sp}"
                                 for sp, count in products.items()]) if products else "∅"
-        
+
+        sp_a_idx = self.species_index[species_A]
+        sp_b_idx = self.species_index[species_B]
+
         # --- Reaction 1: D_A + D_B ---
         state_change_DD = {f"D_{species_A}": -1, f"D_{species_B}": -1}
         for prod_sp, prod_count in products.items():
@@ -360,14 +391,18 @@ class HybridReactionSystem:
         
         def propensity_DD(D, C, r, h):
             return r[rate_name] * D[species_A] * D[species_B] / h
-        
+
+        def vec_propensity_DD(ssa, pde, r, h, _ai=sp_a_idx, _bi=sp_b_idx, _rn=rate_name):
+            return r[_rn] * ssa[_ai].astype(float) * ssa[_bi].astype(float) / h
+
         self.add_hybrid_reaction(
             reactants=hybrid_reactants_DD,
             products=hybrid_products_DD,
             propensity=propensity_DD,
             state_change=state_change_DD,
             label=f"{rate_name}_DD",
-            description=f"D_{species_A} + D_{species_B} → {product_str}"
+            description=f"D_{species_A} + D_{species_B} → {product_str}",
+            vectorized_propensity=vec_propensity_DD,
         )
 
         def _state_change_for_channel(channel_reactants: Dict[str, int], products: Dict[str, int]) -> Dict[str, int]:
@@ -414,13 +449,17 @@ class HybridReactionSystem:
         def propensity_DC(D, C, r, h):
             return r[rate_name] * D[species_A] * C[species_B] / h
 
+        def vec_propensity_DC(ssa, pde, r, h, _ai=sp_a_idx, _bi=sp_b_idx, _rn=rate_name):
+            return r[_rn] * ssa[_ai].astype(float) * pde[_bi] / h
+
         self.add_hybrid_reaction(
             reactants=hybrid_reactants_DC,
             products=hybrid_products_DC,
             propensity=propensity_DC,
             state_change=state_change_DC,
             label=f"{rate_name}_DC",
-            description=f"D_{species_A} + C_{species_B} → {product_str}"
+            description=f"D_{species_A} + C_{species_B} → {product_str}",
+            vectorized_propensity=vec_propensity_DC,
         )
 
         # --- Reaction 3: C_A + D_B ---
@@ -439,13 +478,17 @@ class HybridReactionSystem:
         def propensity_CD(D, C, r, h):
             return r[rate_name] * C[species_A] * D[species_B] / h
 
+        def vec_propensity_CD(ssa, pde, r, h, _ai=sp_a_idx, _bi=sp_b_idx, _rn=rate_name):
+            return r[_rn] * pde[_ai] * ssa[_bi].astype(float) / h
+
         self.add_hybrid_reaction(
             reactants=hybrid_reactants_CD,
             products=hybrid_products_CD,
             propensity=propensity_CD,
             state_change=state_change_CD,
             label=f"{rate_name}_CD",
-            description=f"C_{species_A} + D_{species_B} → {product_str}"
+            description=f"C_{species_A} + D_{species_B} → {product_str}",
+            vectorized_propensity=vec_propensity_CD,
         )
 
 
@@ -458,6 +501,7 @@ class HybridReactionSystem:
         state_change: Dict[str, int],
         label: Optional[str] = None,
         description: Optional[str] = None,
+        vectorized_propensity: Optional[VecPropensityFn] = None,
     ) -> None:
         if label is None:
             label = f"HR{len(self.hybrid_reactions) + 1}"
@@ -481,6 +525,7 @@ class HybridReactionSystem:
                 propensity=propensity,
                 state_change=state_change,
                 description=description,
+                vectorized_propensity=vectorized_propensity,
             )
         )
 

@@ -158,50 +158,43 @@ class SRCMEngine:
         a[2 * n_species * K : 3 * n_species * K] = (self._gamma_arr * state.ssa * dc_allowed).ravel()
 
         # ------------------------------------------------------------------
-        # Hybrid reactions
+        # Hybrid reactions (vectorised over all K compartments at once)
         #
-        # If hr consumes continuous mass (any C_<sp> delta < 0), only allow it
-        # when sufficient_mask[sp, i] == 1 for all such species sp.
-        # Also disallow if pde_mass is negative.
+        # Admissibility rule: if the reaction consumes continuous mass
+        # (C_<sp> delta < 0), only fire where sufficient_mask[sp, i] == 1
+        # and pde_mass[sp, i] >= 0.  Both checks are vectorised.
         # ------------------------------------------------------------------
         base_block = 3 * n_species
         h = float(self.domain.h)
-        species = self.reactions.species
 
         for rxn_idx, hr in enumerate(self.reactions.hybrid_reactions):
-            block = base_block + rxn_idx
-            start = block * K
+            start = (base_block + rxn_idx) * K
 
-            consumed_species = [
-                key.split("_", 1)[1]
-                for key, delta in hr.state_change.items()
-                if key.startswith("C_") and delta < 0
-            ]
-            consumes_C = len(consumed_species) > 0
+            # Build admissibility mask shape (K,) — vectorised
+            admissible = np.ones(K, dtype=bool)
+            if hr.consumes_continuous:
+                for sp in hr.consumed_species:
+                    s_idx = self._sp_to_idx[sp]
+                    admissible &= (sufficient_mask[s_idx] == 1)
+                    admissible &= (pde_mass[s_idx] >= 0.0)
 
-            for i in range(K):
-                if consumes_C:
-                    ok = True
-                    for sp in consumed_species:
-                        s_idx = self._sp_to_idx[sp]
-
-                        if sufficient_mask[s_idx, i] == 0:
-                            ok = False
-                            break
-
-                        if pde_mass[s_idx, i] < 0.0:
-                            ok = False
-                            break
-
-                    if not ok:
+            if hr.vectorized_propensity is not None:
+                # Fast path: one numpy call for all K compartments
+                vals = hr.vectorized_propensity(state.ssa, pde_mass, self.reaction_rates, h)
+                vals = np.where(admissible, vals, 0.0)
+                a[start:start + K] = np.maximum(vals, 0.0)
+            else:
+                # Fallback scalar loop for any manually-added hybrid reactions
+                # that don't carry a vectorized_propensity
+                species = self.reactions.species
+                for i in range(K):
+                    if not admissible[i]:
                         a[start + i] = 0.0
                         continue
-
-                D_local = {sp: int(state.ssa[self._sp_to_idx[sp], i]) for sp in species}
-                C_local = {sp: float(pde_mass[self._sp_to_idx[sp], i]) for sp in species}
-
-                val = float(hr.propensity(D_local, C_local, self.reaction_rates, h))
-                a[start + i] = val if val > 0.0 else 0.0
+                    D_local = {sp: int(state.ssa[self._sp_to_idx[sp], i]) for sp in species}
+                    C_local = {sp: float(pde_mass[self._sp_to_idx[sp], i]) for sp in species}
+                    val = float(hr.propensity(D_local, C_local, self.reaction_rates, h))
+                    a[start + i] = val if val > 0.0 else 0.0
 
         return a
 
