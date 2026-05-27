@@ -20,6 +20,7 @@ from .results import SimulationResults
 
 PDETermsFn = Callable[[np.ndarray, Dict[str, float]], np.ndarray]
 CDRemovalMode = Literal["standard", "probabilistic"]
+CleanupMode  = Literal["off", "always", "reaction"]
 # signature: pde_terms(C, rates) -> reaction-only dC/dt, shape (n_species, Npde)
 
 
@@ -32,7 +33,7 @@ class SRCMEngine:
     conversion: ConversionParams
     reaction_rates: Dict[str, float]          # dict passed into propensity lambdas + pde_terms
     cd_removal_mode: CDRemovalMode = "standard"
-    enable_front_cleanup: bool = True
+    cleanup_mode: CleanupMode = "always"
 
     def __post_init__(self):
         # basic validations
@@ -42,8 +43,8 @@ class SRCMEngine:
             raise ValueError("zero-flux with K<=1 is degenerate (needs at least 2 compartments)")
         if self.cd_removal_mode not in ("standard", "probabilistic"):
             raise ValueError("cd_removal_mode must be 'standard' or 'probabilistic'")
-        if not isinstance(self.enable_front_cleanup, bool):
-            raise ValueError("enable_front_cleanup must be a bool")
+        if self.cleanup_mode not in ("off", "always", "reaction"):
+            raise ValueError("cleanup_mode must be 'off', 'always', or 'reaction'")
 
         # Precompute PDE Laplacian once
         self._L = laplacian_1d(self.domain)
@@ -433,7 +434,12 @@ class SRCMEngine:
             state.add_discrete(species_idx, comp, +1)
 
 
-    def _post_pde_cleanup(self, state: HybridState, rng: np.random.Generator) -> None:
+    def _post_pde_cleanup(
+        self,
+        state: HybridState,
+        rng: np.random.Generator,
+        reaction_mask: Optional[np.ndarray] = None,
+    ) -> None:
         """
         After each PDE step: for any compartment in the CD regime that still holds
         sub-particle PDE mass (Y_k < 1), remove min(1/h, max(u_i, 0)) from each
@@ -446,10 +452,19 @@ class SRCMEngine:
         independently of γ.  It prevents tiny leaked PDE mass at the wave tip
         from driving deterministic (PDE-speed) propagation between Gillespie events.
 
+        Parameters
+        ----------
+        reaction_mask : (n_species, K) bool array or None
+            When cleanup_mode="reaction" this is pre-computed by the caller as
+            ``reaction_term.reshape(n_sp, K, P).max(axis=2) > 0``.
+            Cleanup only fires in compartments where the mask is True, i.e. where
+            the local PDE reaction source is positive.  Passing None means "fire
+            everywhere" (cleanup_mode="always").
+
         Conditions for cleanup in compartment k, species s:
-          1. combined mass < CD_threshold  (compartment is in the stochastic regime)
-          2. PDE mass Y_k in (0, 1)         (sub-particle — deterministic PDE has no
-                                             right to propagate this further)
+          1. combined mass < CD_threshold    (stochastic regime)
+          2. PDE mass Y_k in (0, 1)          (sub-particle)
+          3. reaction_mask[s, k] is True     (only when cleanup_mode="reaction")
         """
         P = self.domain.pde_multiple
         dx = self.domain.dx
@@ -462,6 +477,11 @@ class SRCMEngine:
             for k in range(self.domain.K):
                 # Only act in genuinely stochastic compartments
                 if combined[s_idx, k] >= cd_thr:
+                    continue
+
+                # Reaction-mode mask: skip compartments where the local PDE
+                # source is zero/negative (e.g. pure diffusion, decay-only).
+                if reaction_mask is not None and not reaction_mask[s_idx, k]:
                     continue
 
                 Y_k = pde_mass[s_idx, k]
@@ -672,9 +692,21 @@ class SRCMEngine:
             # deterministic PDE step to t1
             state.pde = rk4_step(state.pde, t=t0, dt=dt, rhs=self.pde_rhs)
 
-            # enforce N-cutoff: zero sub-particle PDE mass at the stochastic front
-            if self.enable_front_cleanup:
+            # N-cutoff: remove sub-particle PDE mass at the stochastic front
+            if self.cleanup_mode == "always":
                 self._post_pde_cleanup(state, rng)
+            elif self.cleanup_mode == "reaction":
+                # Build a per-compartment mask: True where the reaction source
+                # is positive.  One extra evaluation of pde_reaction_terms per
+                # dt — cheap relative to the RK4 step (which evaluates it 4×).
+                rxn = self.pde_reaction_terms(state.pde, self.reaction_rates)
+                rxn_per_comp = (
+                    rxn.reshape(n_species, K, self.domain.pde_multiple)
+                    .max(axis=2)
+                )
+                reaction_mask = rxn_per_comp > 0.0
+                self._post_pde_cleanup(state, rng, reaction_mask=reaction_mask)
+            # cleanup_mode == "off": do nothing
 
             # record at t1
             ssa_out[:, :, n + 1] = state.ssa

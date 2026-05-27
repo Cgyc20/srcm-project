@@ -44,6 +44,7 @@ class SRCMModel:
     _conversion_threshold: Any = None
     _conversion_rate: Any = None
     _removal_mode: str = "bool"
+    _cleanup_mode: str = "always"
 
     def __post_init__(self):
         if not self.species:
@@ -126,6 +127,52 @@ class SRCMModel:
 
     def pde(self, fn: UserRHSFn) -> "SRCMModel":
         self._rhs_user = fn
+        return self
+
+    def cleanup(self, *, enable: bool = True, mode: str = "always") -> "SRCMModel":
+        """
+        Configure the post-PDE N-cutoff cleanup step.
+
+        Parameters
+        ----------
+        enable : bool
+            Set False to disable cleanup entirely.  Equivalent to mode="off".
+            Use for pure-diffusion problems where you do NOT want the Gaussian
+            tail to be erased from stochastic compartments every dt.
+
+        mode : {"always", "reaction"}
+            "always"   — (default) fires on every stochastic compartment that
+                         has sub-particle PDE mass after the RK4 step.  Correct
+                         for FKPP-type travelling waves.
+
+            "reaction" — fires only in compartments where the local PDE reaction
+                         source term is positive (evaluated once per dt after the
+                         RK4 step).  Generalises correctly to any system:
+                           * pure diffusion   → source = 0 everywhere → no cleanup
+                           * FKPP / logistic  → source > 0 at the wave tip → cleanup
+                                                fires exactly there
+                           * decay-only       → source < 0 → no cleanup
+                         This is the recommended mode for general reaction-diffusion
+                         models where the same code needs to handle both diffusive
+                         spread and wave-front propagation.
+
+        Examples
+        --------
+        # Pure diffusion — turn cleanup off entirely
+        model.cleanup(enable=False)
+
+        # General reaction-diffusion — let the reaction term decide
+        model.cleanup(mode="reaction")
+
+        # FKPP travelling wave — original behaviour (explicit, for clarity)
+        model.cleanup(mode="always")
+        """
+        if not enable:
+            self._cleanup_mode = "off"
+            return self
+        if mode not in ("always", "reaction"):
+            raise ValueError("cleanup mode must be 'always' or 'reaction'")
+        self._cleanup_mode = mode
         return self
 
     # ------------------------------------------------------------------
@@ -313,6 +360,7 @@ class SRCMModel:
             conversion=conversion,
             reaction_rates=dict(self._reaction_rates),
             cd_removal_mode="probabilistic" if self._removal_mode == "prob" else "standard",
+            cleanup_mode=self._cleanup_mode,
         )
 
     def _build_ssa_reaction_system(self) ->SSAReaction:
