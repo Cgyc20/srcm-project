@@ -436,8 +436,11 @@ class SRCMEngine:
     def _post_pde_cleanup(self, state: HybridState, rng: np.random.Generator) -> None:
         """
         After each PDE step: for any compartment in the CD regime that still holds
-        sub-particle PDE mass (Y_k < 1), zero out that mass and create a discrete
-        particle with probability = mass removed.
+        sub-particle PDE mass (Y_k < 1), remove min(1/h, max(u_i, 0)) from each
+        PDE cell and create a discrete particle with probability = total mass removed.
+
+        This is identical to the removal performed in _apply_cd_probabilistic during
+        the SSA loop, ensuring the two removal paths are consistent.
 
         This enforces the Brunet-Derrida N-cutoff once per dt, completely
         independently of γ.  It prevents tiny leaked PDE mass at the wave tip
@@ -468,10 +471,15 @@ class SRCMEngine:
                 start = k * P
                 slice_ = state.pde[s_idx, start:start + P]
 
-                # Remove all positive PDE mass (clip negatives first for safety)
-                positive = np.maximum(slice_, 0.0)
-                removed_mass = float(positive.sum() * dx)
-                slice_[:] = 0.0
+                # Remove min(1/h, max(u_i, 0)) from each PDE cell — identical to
+                # the removal in _apply_cd_probabilistic.  This avoids driving any
+                # individual cell negative while still clearing sub-particle mass at
+                # the stochastic front.  (Zeroing the whole slice would be equivalent
+                # only when every cell has u_i <= 1/h, which is not guaranteed.)
+                inv_h = 1.0 / self.domain.h
+                removed = np.minimum(inv_h, np.maximum(slice_, 0.0))
+                removed_mass = float(removed.sum() * dx)
+                slice_ -= removed
 
                 # Probabilistic particle creation conserves expected mass
                 if removed_mass > 0.0 and rng.random() < removed_mass:
